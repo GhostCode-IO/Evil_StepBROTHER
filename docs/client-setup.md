@@ -11,7 +11,7 @@ empty, the box's short host name.
 |---|---|
 | P-touch Editor 5.3 for Mac | verified with 5.3.23: discovery, installed roll, black and two-colour prints |
 | Brother iPrint&Label for iOS | verified (2026-11-21): finds the box, reads the loaded roll with **Check Media**, prints |
-| Other Mac applications with Brother's QL-810W driver for macOS | partly verified (2026-11-21): macOS adds the box from Bonjour, and a job reached the printer (before the box had its colour check); a black/red print is not tested yet |
+| Other Mac applications with Brother's QL-810W driver for macOS | partly verified (2026-11-21): macOS adds the box from Bonjour; the driver's black/red output printed and its monochrome output was refused, both sent from a Mac straight to TCP 9100; printing through a macOS print queue is not tested yet |
 | P-touch Editor for Windows with Brother's QL-810W(c) driver | untested |
 | Brother iPrint&Label for Android | untested |
 
@@ -97,7 +97,14 @@ macOS**, from Brother's support site.
 Tested on 2026-11-21, before the box had its colour check: macOS added the
 box this way, and a job from PowerPoint reached the printer. It was
 monochrome, so the printer, with DK-22251 loaded, rejected it and needed a
-power cycle. A black/red print through this driver has not been tested yet.
+power cycle.
+
+Tested on 2026-11-21 with the colour check, DK-22251 loaded: a label
+rendered by this driver on a Mac (its own filter, run by hand at the 62 mm
+size) was sent from the Mac to TCP 9100. In Monochrome the box refused it:
+nothing printed, and the printer kept working. In 2-Color(Black/Red) it
+printed. Printing through a macOS print queue, from PowerPoint for example,
+has not been tested with the colour check yet.
 
 ## iOS: Brother iPrint&Label
 
@@ -230,7 +237,8 @@ continuous, 4-byte trailer, result ok`.
 | 10 | Checks 3 to 6 from Windows | As above | not run |
 | 11 | iPrint&Label (iOS) finds the box, then prints a label | The app finds the box; the label prints | passed (2026-11-21) |
 | 12 | iPrint&Label (iOS) with DK-22251 loaded: **Check Media** | The app shows the loaded roll | passed (2026-11-21) |
-| 13 | A Mac application through Brother's QL-810W driver, **Color** 2-Color(Black/Red), DK-22251 loaded | The label prints in black and red | not run (the one job tried, on 2026-11-21 before the box had its colour check, was monochrome; the printer rejected it, as the media rules say) |
+| 13 | A Mac application through Brother's QL-810W driver, **Color** 2-Color(Black/Red), DK-22251 loaded | The label prints in black and red | not run through a print queue; the driver's own output, sent to TCP 9100 from a Mac, printed (2026-11-21) |
+| 14 | The same with **Color** left at Monochrome | Nothing prints; `qlctl status` shows the job as `refused`; the printer keeps working | not run through a print queue; the driver's own output, sent to TCP 9100 from a Mac, was refused and the printer kept working (2026-11-21) |
 
 If a check fails, note what you saw (blank label, black only, garbled, an
 error LED, the client's message), run `sudo ./selftest.sh` and `qlctl status`

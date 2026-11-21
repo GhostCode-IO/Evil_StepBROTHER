@@ -93,6 +93,24 @@ entry says whether it is verified).
   die-cut. Replayed against `ql810wc-proxyd` and the test suite's fake
   printer (DK-22251), the Monochrome job was refused before any of its print
   data went out, and the 2-Color job was forwarded byte for byte.
+- **2026-11-21, the colour check on the tested unit:** `setup.sh`, run on the
+  box after its checkout was moved to the new commit (from a git bundle),
+  wrote `RAW_COLOR_CHECK="yes"` into `runtime.env`, restarted
+  `ql810wc-proxyd` and the SNMP agent, and reached `TIER REACHED: T3 (+host
+  SNMP)`. With DK-22251 loaded, the 62 mm jobs rendered by Brother's driver
+  (previous entry) were sent from the Mac to TCP 9100:
+  - Monochrome (12 655 bytes): refused. The Mac's connection was reset; the
+    journal read `refused a print job from …: a black-only job, but the
+    loaded roll, 62mm continuous black/red (DK-22251), takes two-color jobs
+    only. None of its print data was sent to the printer`; the printer kept
+    answering status requests, with no error.
+  - 2-Color(Black/Red) (17 783 bytes): `two-color, requested 62 mm
+    continuous, result ok` after 6.5 s.
+  - `qlctl test-print --mono --force` on the box: refused the same way; qlctl
+    printed the reason and exited with 3.
+  Not tested yet: printing through a macOS print queue with the check on,
+  what iPrint&Label's 402-byte check holds, and a two-colour job on a
+  single-colour roll.
 - **2026-11-21, setup.sh:** the one-liner was piped into `sudo bash` on the
   tested unit, which had been installed from a checkout of its own and had
   no git. The clone came from a git bundle of a pre-release commit, since the
