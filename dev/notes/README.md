@@ -65,15 +65,21 @@ entry says whether it is verified).
     two-colour `qlctl test-print` label and a P-touch Editor for Mac label
     (19 000 bytes, 4-byte trailer, result ok) both printed correctly.
 - **2026-11-21:** Brother iPrint&Label for iOS found the box and printed a
-  label. Its **Check Media** then read the loaded roll (DK-22251) correctly;
-  the app starts out with a 1.4" label size and reads the roll only when
-  asked. It opened three 402-byte connections to TCP 9100 that closed
-  without `0x1A`: two just before its print, and one at about the time
-  **Check Media** was tried (tied to it by its timing only; a later tap sent
-  no data, see the entry on the colour check). `ql810wc-proxyd` logged each as a
-  job that ended early and resynchronised the printer. How the app found the
-  box (Bonjour or SNMP), what those 402 bytes hold and where the app reads
-  the roll were not checked.
+  label. Its **Check Media** read the loaded roll (DK-22251) correctly
+  (whether it was first used before or after the print is not known); the
+  app starts out with a 1.4" label size and reads the roll only when asked.
+  It opened four 402-byte connections to TCP 9100 that ended without
+  `0x1A`: two just before its print, one about 3 minutes before the owner
+  reported that **Check Media** worked, and one about 5 minutes after the
+  owner reported a power cycle of the printer. The app printed nothing after
+  the last two, and what made it open any of the four is not known (a later
+  **Check Media** tap sent no data to TCP 9100, see the entry on the colour
+  check). `ql810wc-proxyd` logged each as a job that ended early (`402 bytes
+  in 0.2 s, result error`, a time that runs to the end of the box's
+  resynchronisation of the printer, not how long the app kept the
+  connection open) and resynchronised the printer. How the app found the box
+  (Bonjour or SNMP), what those 402 bytes hold and where the app reads the
+  roll were not checked.
 - **2026-11-21:** macOS added the box as a printer from its Bonjour record
   (a `dnssd://…._pdl-datastream._tcp.local./?bidi` queue) with Brother's
   QL-810W CUPS driver for macOS (PPD 4.0.4, filter `rastertobrotherQL800`;
@@ -112,14 +118,20 @@ entry says whether it is verified).
   - `qlctl test-print --mono --force` on the box: refused the same way; qlctl
     printed the reason and exited with 3.
   Not tested yet: printing through a macOS print queue with the check on,
-  what iPrint&Label's 402-byte check holds, and a two-colour job on a
+  what iPrint&Label's 402-byte connections hold, and a two-colour job on a
   single-colour roll.
   - Later the same day, an iPrint&Label **Check Media** tap left nothing in
     `ql810wc-proxyd`'s journal: no connection with data reached TCP 9100
     (one with only NULs and set-up commands would have been logged as `no
     print job`). The app reads the roll some other way, presumably the
-    persona's SNMP status block (not captured), and the 402-byte check has
-    been seen only before a print.
+    persona's SNMP status block (not captured). Of the app's four 402-byte
+    connections that day, two came just before its print, and it printed
+    nothing after the other two (see the iPrint&Label entry above).
+  - A print from iPrint&Label was asked for after that. The label printed
+    in answer (7 056 bytes, `two-color, requested 62 mm continuous, 4-byte
+    trailer, result ok`) came from the Mac, which has no iPrint&Label
+    (P-touch Editor was running on it). The app had sent nothing to TCP 9100
+    since the morning, so its 402-byte connections are still not captured.
 - **2026-11-21, setup.sh:** the one-liner was piped into `sudo bash` on the
   tested unit, which had been installed from a checkout of its own and had
   no git. The clone came from a git bundle of a pre-release commit, since the
@@ -325,9 +337,11 @@ What the design rests on, by topic. Each item names its sources (keys in
   A **Check Media** tap on 2026-11-21 sent no data to TCP 9100 (see the
   entry on the colour check), so the app presumably reads the persona's SNMP
   status block (not captured).
-- What iPrint&Label's 402-byte TCP 9100 check, sent before it prints, holds.
-  400 NULs and `ESC @` fit its size, but it was not captured. A print from
-  the app shows it: `ql810wc-proxyd`'s journal tells:
+- What iPrint&Label's 402-byte TCP 9100 connections hold, and what makes the
+  app open them (on 2026-11-21 two came just before its print, and it
+  printed nothing after the other two). 400 NULs and `ESC @` fit their size,
+  but none was captured. The next one shows what it holds (not why the app
+  opened it): `ql810wc-proxyd`'s journal tells:
   `connection from …: 402 bytes, no print job (NUL bytes …, set-up commands
   …, status requests …)` if it holds no print data (NULs, set-up commands,
   status requests, `ESC i U t`), with `; the last N bytes, an incomplete
@@ -336,8 +350,8 @@ What the design rests on, by topic. Each item names its sources (keys in
   know. Print data that shows no colour mode (no `g`/`w` row, `0x0C` or
   `0x1A`) in a stream the tokenizer can follow is then held back by the
   colour check (`RAW_COLOR_CHECK`) and never sent (`none of its print data
-  was sent to the printer`); on 2026-11-21, before the check, all 402 bytes
-  were forwarded.
+  was sent to the printer`); on 2026-11-21, before the box had its colour
+  check, all 402 bytes of each were forwarded.
 - Whether the colour-mismatch error code sits in byte 7 or byte 31 on the
   QL-810W(c) (the Mac SDK reads byte 7; a QL-800 used byte 31) [L1, P4].
 

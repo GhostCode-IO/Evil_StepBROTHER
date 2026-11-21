@@ -954,16 +954,17 @@ class ColorCheckTest(unittest.TestCase):
 
 class SetupConnectionTest(unittest.TestCase):
     """A connection with nothing but NULs and set-up commands is no job:
-    iPrint&Label for iOS presumably sends one before it prints."""
+    iPrint&Label for iOS presumably opens such connections (402 bytes, no
+    print)."""
 
-    def test_iprint_check_is_not_a_job(self):
+    def test_iprint_402_byte_connection_is_not_a_job(self):
         cases = {
-            "iPrint&Label": (INVALIDATE + rasterproto.ESC_INIT,        # 402 bytes, as its check
+            "iPrint&Label": (INVALIDATE + rasterproto.ESC_INIT,        # 402 bytes, like the app's
                              "(NUL bytes 400, set-up commands 1, status requests 0)"),
             "more set-up": (INVALIDATE + rasterproto.ESC_INIT + b"\x1b\x69\x61\x01\x1b\x69\x21\x00"
                             + STATUS_REQUEST, "(NUL bytes 400, set-up commands 3, status requests 1)"),
         }
-        for name, (check, contents) in cases.items():
+        for name, (sent, contents) in cases.items():
             with self.subTest(name):
                 h = Harness(self).start()
                 h.send_job(JOB)
@@ -971,17 +972,17 @@ class SetupConnectionTest(unittest.TestCase):
                 start = len(h.session_bytes())
                 with self.assertLogs("ql810wc.proxyd", "INFO") as logs:
                     sock = h.connect()
-                    sock.sendall(check)
+                    sock.sendall(sent)
                     sock.shutdown(socket.SHUT_WR)
                     self.assertEqual(_how_closed(sock), "fin", "an ordinary close")
-                    _wait_logged(h, logs, f"{len(check)} bytes, no print job")
+                    _wait_logged(h, logs, f"{len(sent)} bytes, no print job")
                 self.assertEqual(h.state()["job"], before, "the last job stays the last job")
-                self.assertTrue(any(f"{len(check)} bytes, no print job {contents}" in line for line in logs.output),
+                self.assertTrue(any(f"{len(sent)} bytes, no print job {contents}" in line for line in logs.output),
                                 logs.output)
                 self.assertFalse(any("middle of a job" in line for line in logs.output), logs.output)
-                _wait_polls(h, start + len(check), 1)
+                _wait_polls(h, start + len(sent), 1)
                 self.assertEqual(h.session_bytes()[start:].replace(STATUS_REQUEST, b""),
-                                 check.replace(STATUS_REQUEST, b""),
+                                 sent.replace(STATUS_REQUEST, b""),
                                  "forwarded as sent, and no resync after it")
                 self.assertEqual(h.model.violations, [], "the polls after it are no status requests inside a job")
 
@@ -989,19 +990,19 @@ class SetupConnectionTest(unittest.TestCase):
         h = Harness(self).start()
         h.send_job(JOB)
         before = h.state()["job"]
-        check = INVALIDATE + rasterproto.ESC_INIT
+        sent = INVALIDATE + rasterproto.ESC_INIT
         start = len(h.session_bytes())
         sock = h.connect()
-        sock.sendall(check[:-1])                            # ... 00 1B
+        sock.sendall(sent[:-1])                            # ... 00 1B
         h.wait_for(lambda: h.session_bytes().endswith(INVALIDATE), "the NULs reached the printer")
         time.sleep(0.2)
-        self.assertFalse(h.session_bytes().endswith(check[:-1]), "half an ESC @ is kept back")
-        sock.sendall(check[-1:])                            # 40
+        self.assertFalse(h.session_bytes().endswith(sent[:-1]), "half an ESC @ is kept back")
+        sock.sendall(sent[-1:])                            # 40
         sock.shutdown(socket.SHUT_WR)
         self.assertEqual(_how_closed(sock), "fin")
         self.assertEqual(h.state()["job"], before, "no job recorded")
-        _wait_polls(h, start + len(check), 1)
-        self.assertEqual(h.session_bytes()[start:].replace(STATUS_REQUEST, b""), check, "then forwarded whole")
+        _wait_polls(h, start + len(sent), 1)
+        self.assertEqual(h.session_bytes()[start:].replace(STATUS_REQUEST, b""), sent, "then forwarded whole")
         self.assertEqual(h.model.violations, [])
 
     def test_an_incomplete_command_at_the_end_is_not_sent(self):

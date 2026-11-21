@@ -204,13 +204,15 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
   switched off until it closes (P-touch closes about 1 s after its trailer).
 - **Set-up commands:** `ESC @`, `ESC i a 01` and `ESC i !` are not job
   content either. A connection with nothing but NULs, set-up commands and
-  `ESC i S` is no job. iPrint&Label for iOS opens a 402-byte connection of
-  its own before it prints (two before the one print observed; a later
-  **Check Media** tap sent no data to TCP 9100); 400 NULs and `ESC @` fit
-  that size, but its content was not captured. Such bytes are forwarded, the
+  `ESC i S` is no job. iPrint&Label for iOS opens 402-byte connections of
+  its own (four on 2026-11-21: two just before its one print, and two
+  with no print from the app after them; a later **Check Media** tap sent no
+  data to TCP 9100); 400 NULs and `ESC @` fit that size, but their content
+  was not captured. Such bytes are forwarded, the
   printer is left at a command boundary and is not resynchronised, and the
   journal line `connection from …: <n> bytes, no print job (NUL bytes …,
-  set-up commands …, status requests …)` counts what it held. While no job
+  set-up commands …, status requests …)` counts what the connection held.
+  While no job
   is open on a connection (before its first job, and in a settled job's
   trailer until the next job starts), a read that ends inside a command
   keeps that command back until it is complete (and drops it, with a journal

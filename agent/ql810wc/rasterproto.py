@@ -558,10 +558,10 @@ def _is_post_job_command(kind: str, params: bytes) -> bool:
 def _is_setup_command(kind: str, params: bytes) -> bool:
     """Printer set-up commands that start no job: ``ESC i a 01`` (raster
     command mode) and ``ESC i !`` (status notifications). Like ``ESC @``, they
-    leave the printer at a command boundary with no job open, and clients send
-    them on their own as well as at the start of a job (iPrint&Label for iOS
-    opens a 402-byte connection before it prints, presumably 400 NULs and
-    ``ESC @``)."""
+    leave the printer at a command boundary with no job open. They come at the
+    start of a job, and a client may send them, like ``ESC @``, on their own
+    (iPrint&Label for iOS opens 402-byte connections that print nothing,
+    presumably 400 NULs and ``ESC @``; not captured)."""
     if kind == "command_mode":
         return params[0] == _RASTER_COMMAND_MODE
     return kind == "auto_status"
@@ -585,8 +585,8 @@ class RasterTokenizer:
       (``ESC @``, ``ESC i a 01``, ``ESC i !``) and the post-job commands:
       ``ESC i S`` and the trailer P-touch for Mac sends on the same
       connection after a job (``ESC i U t`` + 2 bytes, then ``ESC i a FF``).
-      So a stream of NULs and set-up commands alone is no job (iPrint&Label's
-      402-byte check presumably is one).
+      So a stream of NULs and set-up commands alone is no job (each of
+      iPrint&Label's 402-byte connections presumably is such a stream).
     * ``job_ended`` - a ``0x1A`` was parsed at a command position and no job
       content followed it (trailing NULs, set-up and post-job commands keep it
       True).

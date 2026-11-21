@@ -109,8 +109,8 @@ the colour check yet.
 
 ## iOS: Brother iPrint&Label
 
-Verified on the tested unit on 2026-11-21: iPrint&Label for iOS found the
-box, read the loaded roll with **Check Media** and printed.
+Verified on the tested unit on 2026-11-21: iPrint&Label for iOS finds the
+box, reads the loaded roll with **Check Media** and prints.
 
 1. Put the iPhone or iPad on the same network as the box, inside the client
    ranges (`SNMP_PRINTER_ALLOWED_CIDRS`, and `MDNS_ALLOWED_CIDRS` when it is
@@ -125,19 +125,20 @@ box, read the loaded roll with **Check Media** and printed.
    works, not a limitation of the box.
 5. Print. With DK-22251 loaded, follow the [media rules](#media-rules).
 
-Before it prints, the app opens a short connection to TCP 9100 (402 bytes,
-no label) and closes it; on 2026-11-21 it opened two before its print. What
-it sends was not captured; 400 NULs and `ESC @` fit its size. If it holds
-nothing but NULs,
-set-up commands and status requests, the box forwards those bytes and does
-not count them as a job, and the journal shows
+The app also opens connections to TCP 9100 that print nothing (402 bytes
+each). On 2026-11-21 it opened four: two just before its print, and
+two at other times, with no print from the app after them. Their content was
+not captured, and what makes the app open them is not known; 400 NULs and
+`ESC @` fit their size. If one holds nothing but
+NULs, set-up commands and status requests, the box forwards those bytes and
+does not count them as a job, and the journal shows
 `connection from …: 402 bytes, no print job (…)`. If the journal shows a
-`job from …: 402 bytes …` line instead, the check holds more and the box
-records it as a job (`qlctl status` and `selftest.sh` then show it as the
-last job).
+`job from …: 402 bytes …` line instead, the connection holds more and the
+box records it as a job (`qlctl status` and `selftest.sh` then show it as
+the last job).
 
 Later on 2026-11-21 another **Check Media** tap sent no data to TCP 9100:
-`ql810wc-proxyd`'s journal had no entry after it (with the printer ready, a
+`ql810wc-proxyd`'s journal had no entry for it (with the printer ready, a
 connection that sends no data is logged only with `LOG_LEVEL="DEBUG"`). The
 app reads the roll some other way, presumably the box's SNMP status, which
 carries the loaded roll (not captured).
