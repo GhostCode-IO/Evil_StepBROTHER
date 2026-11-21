@@ -954,4 +954,4 @@ dev/                                    for contributors only: SNMP walk tools, 
 
 ## License
 
-See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
