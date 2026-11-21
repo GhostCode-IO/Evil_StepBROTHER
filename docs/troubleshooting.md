@@ -36,7 +36,7 @@ journalctl -u ql810wc-proxyd -n 30 --no-pager
   1 when there is no state file (`ql810wc-proxyd` is not running).
 - Every print leaves one journal line:
   `job from <client>: <n> bytes in <t> s, two-color|black only, requested …,
-  result ok|error|torn (…)`.
+  result ok|error|torn|refused (…)`.
 
 | Symptom | Section |
 |---|---|
@@ -52,7 +52,7 @@ journalctl -u ql810wc-proxyd -n 30 --no-pager
 | P-touch finds the printer but shows no roll | [SNMP checks](#snmp-checks) |
 | P-touch for Mac or iPrint&Label for iOS does not list the printer | [Bonjour checks](#bonjour-checks), [Firewall checks](#firewall-checks) |
 | iPrint&Label (iOS) shows a 1.4" label instead of the loaded roll | Use the app's **Check Media** ([client setup](client-setup.md#ios-brother-iprintlabel)) |
-| A job from PowerPoint or another Mac application stops the printer | [Printer errors](#the-printer-shows-an-error-or-nothing-prints): set the driver's **Color** to **2-Color(Black/Red)** for DK-22251 |
+| A job from PowerPoint or another Mac application prints nothing (macOS may show it as completed), or stops the printer | [Printer errors](#the-printer-shows-an-error-or-nothing-prints): `qlctl status` shows `refused`; set the driver's **Color** to **2-Color(Black/Red)** for DK-22251 |
 
 ## setup.sh problems
 
@@ -121,7 +121,8 @@ Its options and tiers are described in the
 | `FAIL  the Bonjour record does not resolve`, `WARN  Avahi publishes the printer as …`, `WARN  no range in … is a subnet of this host` | [Bonjour checks](#bonjour-checks) |
 | `FAIL  firewall: … is missing in zone …` | Re-run `sudo ./install.sh` ([Firewall checks](#firewall-checks)). |
 | `FAIL  the persona reports the printer as switched off` | Fix the T0 lines first ([Switched off](#p-touch-says-the-printer-is-switched-off)). |
-| `WARN  last job: …` | The last connection to TCP 9100 did not print as it should; the line says why. `error, 402 bytes` after using iPrint&Label for iOS is the app's short check before printing or for **Check Media**, not a fault. `black only` with DK-22251 loaded: [Printer errors](#the-printer-shows-an-error-or-nothing-prints). |
+| `WARN  last job: …` | The last print job did not print as it should; the line says why. `refused`: the box kept the job from the printer because the loaded roll cannot print its colour mode ([Printer errors](#the-printer-shows-an-error-or-nothing-prints)). |
+| `WARN  RAW_COLOR_CHECK is off: …` | The colour check is switched off in `config.env`, so a black-only job on DK-22251 reaches the printer, which then needs a power cycle. Unless you need it off, set `RAW_COLOR_CHECK="yes"` (the default) as root and run `sudo ./install.sh`. When the printer does not report a black/red roll (another roll or no roll is loaded, or there is no status from the printer), the line is `INFO`. |
 | `WARN  … cannot reload: its unit file is outdated`, `WARN  … rejected its last reload` | Re-run `sudo ./install.sh`; for a rejected reload, `journalctl -u ql810wc-snmp-agent` names the file and the problem ([Logs](#logs)). |
 | `DEGRADED: T0-T2 with manual media` | The printer's status block does not fit the shipped OID map: select the roll by hand in P-touch, and attach the `--json` output to a bug report on the [issue tracker](https://github.com/GhostCode-IO/Evil_StepBROTHER/issues). |
 | `NOTE: identity strings in oid-map.yaml …` | Nothing: this is information. The identity strings are placeholders until someone checks them on a real QL-810Wc ([dev/snmpwalk/](../dev/snmpwalk/README.md)); P-touch Editor for Mac and iPrint&Label for iOS work with them. |
@@ -235,29 +236,56 @@ project never changes printer settings.
 
 ## The printer shows an error, or nothing prints
 
-- **A mono job on DK-22251** puts the printer into an error that only a power
-  cycle clears. The job line then says `black only` with a 62 mm roll
-  loaded. On the tested unit it ended with
+- **`refused a print job from …: a black-only job, but the loaded roll, …
+  (DK-22251), takes two-color jobs only`**, and a job line with
+  `result refused`: the job asked for black-only printing while DK-22251 was
+  loaded, which the printer rejects (see the next point). None of its print
+  data reached the printer, and the client's connection was reset; the
+  application may still show the print as completed (macOS does when the
+  reset arrives after its last write). Print it
+  again in 2-colour mode (see [client setup](client-setup.md#media-rules)):
+  with Brother's driver for macOS, set **Color** to **2-Color(Black/Red)**,
+  as its default is **Monochrome**. `… a two-color job, but the loaded roll,
+  …, cannot print red` is the reverse: print black only, or load DK-22251.
+  `RAW_COLOR_CHECK="no"` turns this check off.
+- **A mono job on DK-22251 that reached the printer** (with
+  `RAW_COLOR_CHECK="no"`, or when the box could not tell the job's colour
+  mode or the loaded roll)
+  puts the printer into an error that only a power cycle clears. The job
+  line then says `black only` with a 62 mm roll loaded, or no colour at all.
+  On the tested unit it ended with
   `result error (the printer did not answer status requests after the job)`,
   and `printer unusable: the printer does not answer status requests (3 in a row); reopening it`
-  followed. Switch the printer off and on, and print in 2-colour mode (see
-  [client setup](client-setup.md#media-rules)): with Brother's driver for
-  macOS, set **Color** to **2-Color(Black/Red)**, as its default is
-  **Monochrome**. `qlctl test-print --mono` refuses this combination for
-  that reason.
-- **`closed the connection in the middle of a job (no 0x1A)`**, then a job
-  line with `402 bytes` and
-  `result error (the client closed the connection before the end of the job)`,
-  from an iPhone or iPad: iPrint&Label's short check before it prints and
-  for **Check Media**. Nothing went wrong.
+  followed. Switch the printer off and on, and print in 2-colour mode.
+  `qlctl test-print --mono` refuses this combination for that reason.
+- **`connection from …: 402 bytes, no print job (…)`** from an iPhone or
+  iPad: iPrint&Label's short check before it prints and for **Check Media**.
+  Nothing is wrong.
 - **`result torn`**: the connection ended abnormally before the end of the
   job: reset by the client, no data for `RAW_IDLE_TIMEOUT` (default 300 s),
-  or a job larger than `MAX_JOB_BYTES` (default 16 MiB). The daemon
-  resynchronises the printer (400 NUL bytes, then `ESC @`); a partial label
-  may have printed.
-- **`refused a print job from … (printer not available: …)`**: the printer was
-  absent, in Editor Lite mode or unusable when the client connected. The
-  client got an immediate connection reset.
+  or a job larger than `MAX_JOB_BYTES` (default 16 MiB). When the detail
+  ends with `printer resynchronised`, the daemon resynchronised the printer
+  (400 NUL bytes, then `ESC @`). When it ends with `printer
+  resynchronisation pending`, the resync is not complete yet: while the
+  printer shows an error, no roll, printing or busy, only the 400 NUL bytes
+  and `ESC i S` go out, and the `ESC @` follows once two status polls in a
+  row find it idle; if it did not answer, later status requests (or its
+  reopen) repeat the resync. Either way, a partial label may have printed.
+  When the detail ends with `none of its print data was sent to the
+  printer`, the job was still held back for the colour check: nothing
+  printed, and the printer needed no resync.
+- **`closed the connection in the middle of a job (no 0x1A)`**, then a job
+  line with `result error (the client closed the connection before the end
+  of the job)`: the client closed its side before the `0x1A` that ends the
+  job, and the printer was resynchronised (when the line ends with `printer
+  resynchronisation pending`, that is still to come, as above). The same job
+  line ending `none of its print data was sent to the printer`, with no line
+  before it, is a job still held back for the colour check: nothing reached
+  the printer.
+- **`turned away a print job from … (printer not available: …)`**: the
+  printer was absent, in Editor Lite mode or unusable when the client
+  connected. The client got an immediate connection reset, and the job is
+  recorded as `error`.
 - **`printer unusable: the printer accepted no data for N s after the client
   finished; reopening it`**: the client half-closed, but the printer did not
   take the last of the job within `RAW_IDLE_TIMEOUT`. **`printer unusable: …
@@ -272,8 +300,10 @@ project never changes printer settings.
   recorded; what the client sent after it (P-touch's trailer) could not be
   delivered, for example because the printer stopped taking data.
 - **`stream not fully parsed (…)`** in a job line is informational: the
-  observer did not recognise a command, and the job was still forwarded
-  unchanged.
+  observer did not recognise a command. The job was still forwarded
+  unchanged, unless the line says `result refused`: the job had shown its
+  colour mode before that command, and none of its print data reached the
+  printer.
 - **Cover open** shows as `cover open` in `qlctl status` (the printer reports
   status type `02` with error 2 bit `0x10`). Third-party reports say a
   QL-810W holds a job during such a fault and prints it afterwards; not
@@ -447,7 +477,7 @@ sudo ss -ltnp 'sport = :9100'                                # held by systemd a
 
 | Command | Shows |
 |---|---|
-| `journalctl -u ql810wc-proxyd -b` | jobs (one line each), printer found or lost, Editor Lite, USB errors, refused jobs |
+| `journalctl -u ql810wc-proxyd -b` | jobs (one line each), printer found or lost, Editor Lite, USB errors, refused and turned-away jobs |
 | `journalctl -u ql810wc-snmp-agent -b` | registration with snmpd, the persona's state, OID map problems |
 | `journalctl -u snmpd -b` | snmpd's own warnings; the installer also repeats any line about its drop-in |
 | `journalctl -u avahi-daemon -b` | the Bonjour service and name conflicts |

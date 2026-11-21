@@ -106,6 +106,14 @@ SETTINGS: Dict[str, Setting] = {
         "larger job is torn and the printer resynchronised. The 16 MiB default is well above "
         "an uncompressed 1 m two-color label (about 2.2 MB, or 4.4 MB at 600 dpi). "
         "Empty = 16777216.", minimum=64 * 1024, maximum=1 << 30),
+    "RAW_COLOR_CHECK": Setting(
+        "yes", "bool", "yes = refuse a print job whose colour mode the loaded roll cannot print: "
+        "a black-only job while a black/red roll (DK-22251) is loaded, or a two-color job while "
+        "a single-colour roll is loaded. The printer rejects such a job itself, and after a "
+        "black-only job on DK-22251 the tested QL-810Wc answered nothing until it was switched "
+        "off and on. None of a refused job's print data reaches the printer, and the client "
+        "sees the connection reset. Jobs whose colour mode or roll is not certain always go "
+        "through. no = forward every job unchecked."),
     "STATUS_POLL_SECONDS": Setting(
         "3", "int", "Seconds between status polls (ESC i S over USB) while idle. The "
         "printer is never polled during a job.", minimum=1, maximum=60, required=True),
@@ -154,7 +162,10 @@ SETTINGS: Dict[str, Setting] = {
     "STATUS_MAX_AGE_SECONDS": Setting(
         "60", "int", "A status frame older than this while no job is running is stale: "
         "the persona then reports the printer as unavailable instead of serving old "
-        "media and state. Must be at least twice STATUS_POLL_SECONDS.",
+        "media and state. The colour check of ql810wc-proxyd (RAW_COLOR_CHECK) asks the "
+        "printer for a new status when the last one is older (not while the printer's "
+        "input state is unknown), and lets a job through unchecked if none comes. Must "
+        "be at least twice STATUS_POLL_SECONDS.",
         minimum=5, maximum=86400, required=True),
     "PERSONA_LOCATION": Setting(
         "", "str", "sysLocation.0 of the printer persona (Brother clients show it as the "

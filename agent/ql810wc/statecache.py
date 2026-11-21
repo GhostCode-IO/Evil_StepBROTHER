@@ -16,7 +16,7 @@ Schema 1 (docs/architecture.md section 5)::
                 "ieee1284_id"},
      "status": {"raw_hex", "polled", "parsed"},
      "job":    {"active", "peer", "started", "bytes", "two_color",
-                "last_result": "ok|error|torn|null", "last_finished"}}
+                "last_result": "ok|error|torn|refused|null", "last_finished"}}
 
 Timestamps are wall-clock seconds since the epoch (``time.time()``).
 """
@@ -42,8 +42,8 @@ SCHEMA_VERSION = 1
 DEFAULT_PATH = "/run/ql810wc-proxy/state.json"
 #: Device states written by the proxy.
 DEVICE_STATES = ("ready", "absent", "mass-storage", "error")
-#: Job results written by the proxy.
-JOB_RESULTS = ("ok", "error", "torn")
+#: Job results written by the proxy ("refused": RAW_COLOR_CHECK kept it from the printer).
+JOB_RESULTS = ("ok", "error", "torn", "refused")
 #: Files larger than this are rejected as corrupt (the document is ~2 KiB).
 MAX_STATE_BYTES = 1 << 20
 _FILE_MODE = 0o644

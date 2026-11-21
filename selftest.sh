@@ -1535,6 +1535,13 @@ section_two_color() {
     check t1 skip t1.roll "the loaded roll is not black/red (${ST[media_desc]:-no roll}): load DK-22251 to print," \
                           "and check, two-colour labels"
   fi
+  # ql810wc-proxyd's colour check, as runtime.env sets it (the daemon's default is on).
+  if [[ -n "${RT[RAW_COLOR_CHECK]+set}" ]] && ! qlp_is_yes "${RT[RAW_COLOR_CHECK]}"; then
+    local lvl=info
+    if [[ "${ST[media_two_color]:-0}" == 1 ]]; then lvl=warn; fi
+    check t1 "$lvl" t1.colorcheck "RAW_COLOR_CHECK is off: every job goes to the printer unchecked, and after a" \
+                                  "black-only job on DK-22251 the printer needs a power cycle"
+  fi
   if [[ "${ST[job_two_color]:-}" == 1 && "${ST[job_last_result]:-}" == ok ]]; then
     check t1 info t1.lastjob "the last job was two-colour and the printer reported it done (${ST[job_last_ago]:-?} ago)"
   fi

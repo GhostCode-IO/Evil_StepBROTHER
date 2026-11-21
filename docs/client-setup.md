@@ -11,7 +11,7 @@ empty, the box's short host name.
 |---|---|
 | P-touch Editor 5.3 for Mac | verified with 5.3.23: discovery, installed roll, black and two-colour prints |
 | Brother iPrint&Label for iOS | verified (2026-11-21): finds the box, reads the loaded roll with **Check Media**, prints |
-| Other Mac applications with Brother's QL-810W driver for macOS | partly verified (2026-11-21): macOS adds the box from Bonjour and jobs reach the printer; a black/red print is not tested yet |
+| Other Mac applications with Brother's QL-810W driver for macOS | partly verified (2026-11-21): macOS adds the box from Bonjour, and a job reached the printer (before the box had its colour check); a black/red print is not tested yet |
 | P-touch Editor for Windows with Brother's QL-810W(c) driver | untested |
 | Brother iPrint&Label for Android | untested |
 
@@ -88,14 +88,16 @@ macOS**, from Brother's support site.
 2. When you print, choose the label size: DK-22251 is the 62 mm continuous
    size, shown as `2.4"`. While DK-22251 is loaded, also set **Color** to
    **2-Color(Black/Red)**, even for black-only labels. The driver's default
-   is **Monochrome**, and the printer refuses a monochrome job on this roll
-   and then has to be switched off and on ([media rules](#media-rules)). A
-   preset in the print dialog keeps these settings.
+   is **Monochrome**, which this roll cannot print: the box refuses such a
+   job, so nothing prints, although macOS may show the job as completed
+   (`qlctl status` on the box shows it as `refused`;
+   [media rules](#media-rules)). A preset in the print dialog keeps these
+   settings.
 
-Tested on 2026-11-21: macOS added the box this way, and a job from
-PowerPoint reached the printer. It was monochrome, so the printer, with
-DK-22251 loaded, refused it and needed a power cycle. A black/red print
-through this driver has not been tested yet.
+Tested on 2026-11-21, before the box had its colour check: macOS added the
+box this way, and a job from PowerPoint reached the printer. It was
+monochrome, so the printer, with DK-22251 loaded, rejected it and needed a
+power cycle. A black/red print through this driver has not been tested yet.
 
 ## iOS: Brother iPrint&Label
 
@@ -116,10 +118,14 @@ box, read the loaded roll with **Check Media** and printed.
 5. Print. With DK-22251 loaded, follow the [media rules](#media-rules).
 
 Before it prints, and for **Check Media**, the app opens a short connection
-to TCP 9100 (402 bytes, no label) and closes it. `ql810wc-proxyd` records it
-as a job that ended early, so `qlctl status` shows the last job as `error`
-and `selftest.sh` warns `last job: error` until the next label prints.
-Nothing is wrong.
+to TCP 9100 (402 bytes, no label) and closes it. What it sends was not
+captured; 400 NULs and `ESC @` fit its size. If it holds nothing but NULs,
+set-up commands and status requests, the box forwards those bytes and does
+not count them as a job, and the journal shows
+`connection from …: 402 bytes, no print job (…)`. If the journal shows a
+`job from …: 402 bytes …` line instead, the check holds more and the box
+records it as a job (`qlctl status` and `selftest.sh` then show it as the
+last job).
 
 Not checked yet: which of the box's answers (Bonjour or SNMP) the app uses
 to find the box and to read the roll. If the app does not find the box, the
@@ -164,14 +170,23 @@ with the box is part of the checklist below.
   application did exactly that (2026-11-21): the printer answered no status
   requests until it was switched off and on. Third parties report the same
   for the QL-810W, and a Brother FAQ describes P-touch refusing such a job
-  because black/red media is installed. The proxy forwards jobs unchanged,
-  so it cannot correct a wrong mode.
+  because black/red media is installed.
+- The box therefore refuses a mono job while this roll is loaded
+  (`RAW_COLOR_CHECK`, on by default). None of the job's print data reaches
+  the printer: nothing prints, the client's connection is reset, and
+  `qlctl status` shows the job as `refused`. The application is not told
+  why and may report no error at all: macOS shows such a job as completed
+  when the reset arrives after its last write. The box cannot turn the job
+  into a two-colour one (it forwards jobs unchanged), so print it again in
+  two-colour mode.
 - P-touch Editor for Mac selects the black/red mode by itself when it sees
   this roll (status byte 25 = `0x81`). With Brother's driver for macOS, set
   **Color** to **2-Color(Black/Red)**; on Windows, turn on 2-Color in the
   driver.
-- If it happens anyway: switch the printer off and on. `ql810wc-proxyd` finds
-  it again within a few seconds.
+- If the printer shows the error anyway (with `RAW_COLOR_CHECK="no"`, or
+  when the box could not tell the job's colour mode or the loaded roll),
+  switch it off and on.
+  `ql810wc-proxyd` finds it again within a few seconds.
 - Server-side test labels, with `qlctl` standing for
   `python3 -I -B /usr/local/libexec/ql810wc-proxy/qlctl`: `qlctl test-print`
   (two-colour bars) or `qlctl test-print --two-color --pattern black` (black
@@ -186,7 +201,9 @@ with the box is part of the checklist below.
 - Print black only. The roll is not black/red: Brother's SDK has an error
   for a two-colour job on such a roll ("paper does not support two-color
   printing"), and third-party drivers report it from other QL models. Not yet
-  reproduced on the tested unit.
+  reproduced on the tested unit. The box refuses a two-colour job while a
+  single-colour roll is loaded (`RAW_COLOR_CHECK`), so such a job normally
+  never reaches the printer.
 - `qlctl test-print` needs continuous tape and refuses die-cut labels.
 - After you swap rolls, the box reports the new roll within
   `STATUS_POLL_SECONDS`. Whether P-touch picks it up without re-selecting the
@@ -213,7 +230,7 @@ continuous, 4-byte trailer, result ok`.
 | 10 | Checks 3 to 6 from Windows | As above | not run |
 | 11 | iPrint&Label (iOS) finds the box, then prints a label | The app finds the box; the label prints | passed (2026-11-21) |
 | 12 | iPrint&Label (iOS) with DK-22251 loaded: **Check Media** | The app shows the loaded roll | passed (2026-11-21) |
-| 13 | A Mac application through Brother's QL-810W driver, **Color** 2-Color(Black/Red), DK-22251 loaded | The label prints in black and red | not run (a monochrome job was refused, as the media rules say) |
+| 13 | A Mac application through Brother's QL-810W driver, **Color** 2-Color(Black/Red), DK-22251 loaded | The label prints in black and red | not run (the one job tried, on 2026-11-21 before the box had its colour check, was monochrome; the printer rejected it, as the media rules say) |
 
 If a check fails, note what you saw (blank label, black only, garbled, an
 error LED, the client's message), run `sudo ./selftest.sh` and `qlctl status`

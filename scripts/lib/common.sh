@@ -1146,7 +1146,7 @@ EOF
 # is first checked with the daemons' own loader (ql810wc.config, once deployed)
 # so a value they would reject fails the install, not a later service start.
 QLP_RUNTIME_KEYS=(PROXY_IP RAW_PORT RAW_BIND RAW_BIDIRECTIONAL RAW_IDLE_TIMEOUT MAX_JOB_BYTES
-                  STATUS_POLL_SECONDS CUPS_QUEUE USB_VENDOR_ID USB_PRODUCT_ID USB_SERIAL
+                  RAW_COLOR_CHECK STATUS_POLL_SECONDS CUPS_QUEUE USB_VENDOR_ID USB_PRODUCT_ID USB_SERIAL
                   MEDIA_DEFAULT MEDIA_SECOND SNMP_AGENT_MODE PRINTER_NAME_SUFFIX
                   PERSONA_LOCATION PERSONA_CONTACT PERSONA_SYSNAME PERSONA_MAC PERSONA_SERIAL
                   LOG_LEVEL)
@@ -1168,7 +1168,7 @@ qlp_require_int_or_empty() { # VAR min max
 #   LOG_LEVEL            DEBUG, INFO, WARNING or ERROR, any case (empty = INFO)
 qlp_validate_runtime_settings() {
   local level="${LOG_LEVEL:-}"
-  qlp_require_bool RAW_BIDIRECTIONAL
+  qlp_require_bool RAW_BIDIRECTIONAL RAW_COLOR_CHECK
   qlp_require_int STATUS_POLL_SECONDS 1 60
   qlp_require_int_or_empty RAW_IDLE_TIMEOUT 10 86400
   qlp_require_int_or_empty MAX_JOB_BYTES 65536 1073741824
@@ -1195,7 +1195,7 @@ qlp_status_max_age() { # status-poll-seconds
 qlp_runtime_value() { # key
   local v="${!1:-}"
   case "$1" in
-    RAW_BIDIRECTIONAL) if qlp_is_yes "$v"; then v=yes; else v=no; fi ;;
+    RAW_BIDIRECTIONAL|RAW_COLOR_CHECK) if qlp_is_yes "$v"; then v=yes; else v=no; fi ;;
     USB_VENDOR_ID|USB_PRODUCT_ID) v="${v,,}" ;;
     STATUS_POLL_SECONDS|RAW_IDLE_TIMEOUT|MAX_JOB_BYTES)
       if [[ "$v" =~ ^[0-9]{1,18}$ ]]; then v="$((10#$v))"; fi ;;

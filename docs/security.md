@@ -54,7 +54,9 @@ address, the size and duration, the colour mode, the requested media and the
 result.
 
 Residual risks within the allowed networks: wasted labels; a mono job on
-DK-22251, which leaves the printer in an error until a power cycle; and,
+DK-22251 that reaches the printer (with `RAW_COLOR_CHECK="no"`, or when the
+box cannot tell the job's colour mode or the loaded roll, as with a job
+without `ESC i K`), which leaves it in an error until a power cycle; and,
 because jobs are served one at a time, a client that occupies the printer. A
 client that sends nothing is dropped after `RAW_IDLE_TIMEOUT` (default
 300 s), a vanished one after about a minute of failed TCP keepalives, and a

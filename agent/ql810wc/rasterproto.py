@@ -508,7 +508,7 @@ def iter_status_frames(buf: Union[bytes, bytearray, memoryview]) -> List[Status]
 
 
 # ---------------------------------------------------------------------------
-# Job tokenizer (observation only: the proxy forwards bytes unmodified)
+# Job tokenizer (it never modifies bytes; proxyd's colour check and hold-back act on what it sees)
 # ---------------------------------------------------------------------------
 
 class Event(NamedTuple):
@@ -555,6 +555,18 @@ def _is_post_job_command(kind: str, params: bytes) -> bool:
     return kind in ("status_request", "esc_i_u_t")
 
 
+def _is_setup_command(kind: str, params: bytes) -> bool:
+    """Printer set-up commands that start no job: ``ESC i a 01`` (raster
+    command mode) and ``ESC i !`` (status notifications). Like ``ESC @``, they
+    leave the printer at a command boundary with no job open, and clients send
+    them on their own as well as at the start of a job (iPrint&Label for iOS
+    opens a 402-byte connection before each print and for Check Media,
+    presumably 400 NULs and ``ESC @``)."""
+    if kind == "command_mode":
+        return params[0] == _RASTER_COMMAND_MODE
+    return kind == "auto_status"
+
+
 class RasterTokenizer:
     """Incremental, length-driven parser of a Brother QL raster job stream.
 
@@ -569,11 +581,24 @@ class RasterTokenizer:
     * ``at_command_boundary`` - the next byte starts a new command (False
       mid-command and once opaque).
     * ``in_job`` - job content was parsed and the job has not ended yet. Job
-      content is every command except NUL padding and the post-job commands:
+      content is every command except NUL padding, the set-up commands
+      (``ESC @``, ``ESC i a 01``, ``ESC i !``) and the post-job commands:
       ``ESC i S`` and the trailer P-touch for Mac sends on the same
       connection after a job (``ESC i U t`` + 2 bytes, then ``ESC i a FF``).
+      So a stream of NULs and set-up commands alone is no job (iPrint&Label's
+      402-byte check presumably is one).
     * ``job_ended`` - a ``0x1A`` was parsed at a command position and no job
-      content followed it (trailing NULs and post-job commands keep it True).
+      content followed it (trailing NULs, set-up and post-job commands keep it
+      True).
+    * ``setup_commands`` - set-up commands parsed (``ESC @``, ``ESC i a 01``,
+      ``ESC i !``).
+    * ``color_decided`` / ``requested_two_color`` - the colour mode the job
+      asks for, decided at its first ``g`` or ``w`` raster row or, without
+      one, at its first print command: True (two-colour), False (black only)
+      or None (unknown). It is known only when an ``ESC i K`` came before that
+      point and, at a raster row, agrees with it (bit 0 set for ``w`` rows,
+      clear for ``g`` rows); ``ESC @`` clears the ``ESC i K`` it relies on.
+      Both reset when the next job's content starts.
     * ``jobs`` / ``pages`` - ``0x1A`` count / print commands (``0x0C`` + ``0x1A``).
     * ``two_color`` - bit 0 of the last ``ESC i K`` (``expanded_mode`` holds
       the raw value). Reset, with ``requested_media``, ``compression`` and
@@ -591,6 +616,8 @@ class RasterTokenizer:
       ``ESC i a FF`` that ends P-touch's trailer). After that the stream is
       only counted. A job that ended before the stream went opaque stays
       ended.
+    * ``partial_command`` (property) - the bytes of the command the stream
+      stops in, while it stops inside a command header (b"" otherwise).
     * ``opaque_end`` - when parsing stopped at a complete command (an
       ``ESC i a`` switch out of raster mode), the stream offset just past it,
       else None. While ``bytes_seen`` equals it, nothing has followed that
@@ -616,6 +643,9 @@ class RasterTokenizer:
         self.command_mode: Optional[int] = None
         self.auto_status: Optional[int] = None
         self.status_requests = 0
+        self.setup_commands = 0
+        self.color_decided = False
+        self.requested_two_color: Optional[bool] = None
         self.nul_bytes = 0
         self.row_counts: Dict[str, int] = {"g": 0, "w1": 0, "w2": 0, "Z": 0}
         self.opaque: Optional[str] = None
@@ -629,6 +659,17 @@ class RasterTokenizer:
         """Raster lines as ``ESC i z`` counts them (a w01+w02 pair is one line)."""
         rc = self.row_counts
         return rc["g"] + rc["Z"] + max(rc["w1"], rc["w2"])
+
+    @property
+    def partial_command(self) -> bytes:
+        """The bytes of the command the stream stops in, when it stops inside a
+        command header: b"" at a command boundary, inside a raster row's
+        payload, and once opaque. ql810wc-proxyd keeps these bytes back while
+        no job has started, so a read that ends inside a command never leaves
+        the printer waiting for the rest of it."""
+        if self.opaque is not None or self._skip:
+            return b""
+        return bytes(self._carry)
 
     @property
     def needs_resync(self) -> bool:
@@ -653,6 +694,9 @@ class RasterTokenizer:
             "command_mode": self.command_mode,
             "auto_status": self.auto_status,
             "status_requests": self.status_requests,
+            "setup_commands": self.setup_commands,
+            "color_decided": self.color_decided,
+            "requested_two_color": self.requested_two_color,
             "nul_bytes": self.nul_bytes,
             "in_job": self.in_job,
             "job_ended": self.job_ended,
@@ -713,6 +757,8 @@ class RasterTokenizer:
                     self._go_opaque(events, base + i, buf[i:i + 3], f"{what} 0x{sel:02x}")
                     return
                 self._job_content()
+                if not self.color_decided:
+                    self._decide_color(op == 0x77)
                 end = i + 3 + buf[i + 2]
                 if end > n:
                     self._skip = end - n
@@ -727,11 +773,15 @@ class RasterTokenizer:
                 continue
             if op == 0x0C:                                   # FF: print, more pages follow
                 self._job_content()
+                if not self.color_decided:
+                    self._decide_color(None)
                 self.pages += 1
                 events.append(Event("print", base + i))
                 i += 1
                 continue
             if op == 0x1A:                                   # ^Z: print last page = job end
+                if not self.color_decided:
+                    self._decide_color(None)
                 self.pages += 1
                 self.jobs += 1
                 self.in_job = False
@@ -753,8 +803,8 @@ class RasterTokenizer:
             if i + 2 > n:
                 break
             op2 = buf[i + 1]
-            if op2 == 0x40:                                  # ESC @
-                self._job_content()
+            if op2 == 0x40:                                  # ESC @: set-up, starts no job
+                self.setup_commands += 1
                 self.two_color = False
                 self.expanded_mode = None
                 self.requested_media = None
@@ -806,7 +856,9 @@ class RasterTokenizer:
             self.status_requests += 1
         elif kind == "command_mode":
             self.command_mode = params[0]
-        if not _is_post_job_command(kind, params):
+        if _is_setup_command(kind, params):
+            self.setup_commands += 1
+        elif not _is_post_job_command(kind, params):
             self._job_content()
         if kind == "expanded_mode":
             self.expanded_mode = params[0]
@@ -838,6 +890,21 @@ class RasterTokenizer:
         if not self.in_job:
             self.in_job = True
             self.job_ended = False
+            self.color_decided = False
+            self.requested_two_color = None
+
+    def _decide_color(self, two_color_row: Optional[bool]) -> None:
+        """Record the colour mode the job asks for, at its first raster row
+        (``two_color_row``: True for ``w``, False for ``g``) or, without one,
+        at its first print command (None): the last ``ESC i K`` bit 0, unless
+        the row disagrees with it; unknown without an ``ESC i K``."""
+        self.color_decided = True
+        mode = self.expanded_mode
+        if mode is None:
+            self.requested_two_color = None
+            return
+        two = bool(mode & 0x01)
+        self.requested_two_color = None if two_color_row is not None and two_color_row != two else two
 
     def _go_opaque(self, events: List[Event], offset: int, head: bytes, reason: str,
                    end: Optional[int] = None) -> None:

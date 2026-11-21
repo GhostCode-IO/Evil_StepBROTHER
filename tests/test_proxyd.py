@@ -22,6 +22,7 @@ import threading
 import time
 import unittest
 from typing import Any, Callable, Dict, List, Optional
+from unittest import mock
 
 from tests.fake_printer import (FAKE_SERIAL, PTOUCH_TRAILER, RESYNC_REQUEST, TEST_DEVICE_ID, FakeBus,
                                 PrinterModel, PtyPrinter)
@@ -39,6 +40,9 @@ PROXYD = REPO / "agent" / "ql810wc-proxyd"
 logging.getLogger("ql810wc").addHandler(logging.NullHandler())
 JOB = rasterproto.make_test_job()                                   # two-colour bars, 600 rows
 JOB_B = rasterproto.make_test_job(rows=300, pattern="black")
+MONO = rasterproto.make_test_job(two_color=False, rows=150)         # black only, 62 mm
+#: ESC i z: the first command of a test job's content (the bytes before it are set-up).
+PRINT_INFO = b"\x1b\x69\x7a"
 HAVE_PTY = os.name == "posix" and sys.platform != "cygwin"
 
 
@@ -79,6 +83,18 @@ def _how_closed(sock: socket.socket, timeout: float = 15.0) -> str:
     except ConnectionResetError:
         return "rst"
     return "fin"
+
+
+def _send_refusable(h: "Harness", data: bytes) -> str:
+    """Send a job like CUPS does; "rst" if the proxy reset the connection
+    (while it was being sent or after), "fin" for an ordinary close."""
+    sock = h.connect()
+    try:
+        sock.sendall(data)
+        sock.shutdown(socket.SHUT_WR)
+    except OSError:
+        return "rst"
+    return _how_closed(sock)
 
 
 def _recv_until_closed(sock: socket.socket, timeout: float = 15.0) -> bytes:
@@ -705,6 +721,358 @@ class ForwardingTest(unittest.TestCase):
         self.assertEqual(h.state()["job"]["last_result"], "ok")
 
 
+class ColorCheckTest(unittest.TestCase):
+    """RAW_COLOR_CHECK: a job whose colour mode the loaded roll cannot print
+    never reaches the printer; every other job goes through byte for byte."""
+
+    def assert_nothing_of_the_job_arrived(self, h: Harness) -> None:
+        self.assertNotIn(PRINT_INFO, h.session_bytes())
+        self.assertEqual(h.model.jobs, [])
+        self.assertEqual(h.model.violations, [])
+        self.assertFalse(h.model.mute)
+
+    def test_black_only_job_on_a_black_red_roll_is_refused(self):
+        h = Harness(self).start()
+        with self.assertLogs("ql810wc.proxyd", "WARNING") as logs:
+            self.assertEqual(_send_refusable(h, MONO), "rst", "the client sees the job fail")
+        job = h.state()["job"]
+        self.assertEqual(job["last_result"], "refused")
+        self.assertFalse(job["active"])
+        self.assertIs(job["two_color"], False)
+        self.assertEqual(job["requested_media"]["width"], 62)
+        self.assertEqual(job["last_detail"], "a black-only job, but the loaded roll, 62mm continuous black/red "
+                                             "(DK-22251), takes two-color jobs only")
+        self.assertTrue(any("refused a print job from 127.0.0.1:" in line
+                            and "None of its print data was sent to the printer" in line
+                            for line in logs.output), logs.output)
+        self.assert_nothing_of_the_job_arrived(h)
+        start = len(h.session_bytes())
+        _wait_polls(h, start, 2)
+        self.assertEqual(h.session_bytes()[start:].replace(STATUS_REQUEST, b""), b"",
+                         "no resync: the printer's input was never touched")
+        h.send_job(JOB)
+        self.assertEqual(h.state()["job"]["last_result"], "ok")
+        self.assertEqual(h.session_bytes().count(JOB), 1)
+
+    def test_two_color_job_on_a_single_color_roll_is_refused(self):
+        h = Harness(self)
+        h.model.set_media("62")                     # DK-22205: one colour
+        h.start()
+        self.assertEqual(_send_refusable(h, JOB), "rst")
+        job = h.state()["job"]
+        self.assertEqual(job["last_result"], "refused")
+        self.assertIs(job["two_color"], True)
+        self.assertIn("a two-color job", job["last_detail"])
+        self.assertIn("cannot print red", job["last_detail"])
+        self.assert_nothing_of_the_job_arrived(h)
+        h.send_job(MONO)
+        self.assertEqual(h.state()["job"]["last_result"], "ok")
+        self.assertEqual(h.session_bytes().count(MONO), 1, "a black-only job on this roll goes through")
+
+    def test_the_check_off_forwards_every_job(self):
+        with self.assertLogs("ql810wc.proxyd", "WARNING") as logs:
+            h = Harness(self, color_check=False).start()
+        self.assertTrue(any("RAW_COLOR_CHECK is off" in line for line in logs.output), logs.output)
+        h.send_job(MONO)
+        self.assertEqual(h.session_bytes().count(MONO), 1, "forwarded byte for byte")
+        job = h.state()["job"]
+        self.assertEqual(job["last_result"], "error")
+        self.assertIn("media does not support monochrome printing", job["last_detail"])
+        self.assertTrue(h.model.jobs[-1]["failed"])
+        self.assertTrue(h.model.mute, "what the check prevents: the printer no longer answers")
+
+    def test_an_uncertain_colour_mode_goes_through(self):
+        # The check does not guess. Without ESC i K the printer presumably prints in its
+        # default mode, black only, and the fake printer then reports the mono error.
+        k = MONO.index(b"\x1b\x69\x4b")          # ESC i K 08
+        cases = {
+            "no ESC i K": MONO[:k] + MONO[k + 4:],
+            "ESC i K two-colour with g rows": MONO[:k] + b"\x1b\x69\x4b\x09" + MONO[k + 4:],
+        }
+        for name, job in cases.items():
+            with self.subTest(name):
+                h = Harness(self).start()
+                h.send_job(job)
+                self.assertEqual(h.session_bytes().count(job), 1)
+                self.assertNotEqual(h.state()["job"]["last_result"], "refused")
+
+    def test_an_uncertain_roll_goes_through(self):
+        stale = Harness(self, status_max_age=0.0).start()
+        stale.send_job(MONO)
+        self.assertEqual(stale.session_bytes().count(MONO), 1, "no status frame recent enough")
+        unknown = Harness(self)
+        unknown.model.base[25] = 0x00               # neither 0x81 nor 0x01
+        unknown.start()
+        unknown.send_job(MONO)
+        self.assertEqual(unknown.session_bytes().count(MONO), 1, "a byte 25 the check does not know")
+        self.assertEqual(unknown.state()["job"]["last_result"], "ok")
+        empty = Harness(self)
+        empty.model.base[10] = 0                    # width 0: the roll was taken out
+        empty.start()
+        empty.send_job(MONO)
+        self.assertEqual(empty.session_bytes().count(MONO), 1, "no roll: the printer reports it itself")
+
+    def test_a_job_is_held_until_it_shows_its_colour_mode(self):
+        h = Harness(self, poll_seconds=0.1).start()
+        cut = JOB.index(b"\x77\x01")               # the first raster row
+        sock = h.connect()
+        sock.sendall(JOB[:cut])
+        h.wait_state(lambda s: s["job"]["active"], "the job started")
+        time.sleep(0.5)                            # five poll intervals
+        self.assertNotIn(PRINT_INFO, h.session_bytes(), "held: none of the job is with the printer yet")
+        sock.sendall(JOB[cut:])
+        sock.shutdown(socket.SHUT_WR)
+        _recv_until_closed(sock)
+        self.assertEqual(h.state()["job"]["last_result"], "ok")
+        self.assertEqual(h.session_bytes().count(JOB), 1, "then forwarded whole, in order, unmodified")
+        self.assertEqual(h.model.violations, [])
+
+    def test_a_job_that_ends_while_held_sends_nothing(self):
+        header = JOB[JOB.index(PRINT_INFO):JOB.index(b"\x77\x01")]   # job content, no raster row
+        h = Harness(self).start()
+        self.assertEqual(h.send_job(header), b"")
+        job = h.state()["job"]
+        self.assertEqual(job["last_result"], "error")
+        self.assertIn("none of its print data was sent to the printer", job["last_detail"])
+        sock = h.connect()
+        sock.sendall(header)
+        h.wait_state(lambda s: s["job"]["active"], "the second job started")
+        _reset(sock)
+        job = h.wait_state(lambda s: s["job"]["last_result"] == "torn", "torn job")["job"]
+        self.assertIn("none of its print data was sent to the printer", job["last_detail"])
+        received = h.session_bytes()
+        self.assertTrue(received.startswith(RESYNC_REQUEST))
+        self.assertEqual(received[len(RESYNC_REQUEST):].replace(STATUS_REQUEST, b""), b"",
+                         "nothing sent, so nothing to resynchronise")
+
+    def test_a_mode_shown_before_the_stream_turns_opaque_counts(self):
+        # An unknown command right after the first g row: refused however the job is split.
+        row = MONO.index(b"\x67\x00")
+        cut = row + 3 + MONO[row + 2]               # just after the first g row
+        job = MONO[:cut] + b"\x1b\x69\x55\x58\x00" + MONO[cut:]
+        for pieces in (1, 2):
+            with self.subTest(pieces=pieces):
+                h = Harness(self).start()
+                sock = h.connect()
+                try:
+                    if pieces == 1:
+                        sock.sendall(job)
+                    else:
+                        sock.sendall(job[:cut])
+                        time.sleep(0.2)
+                        sock.sendall(job[cut:])
+                    sock.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+                self.assertEqual(_how_closed(sock), "rst")
+                self.assertEqual(h.state()["job"]["last_result"], "refused")
+                self.assertNotIn(PRINT_INFO, h.session_bytes())
+                self.assertFalse(h.model.mute)
+
+    def test_a_stale_roll_is_read_again_before_the_check(self):
+        # The idle polls pause while set-up commands wait on a connection, so the last
+        # status goes stale; the check asks for a new one instead of letting the job through.
+        h = Harness(self, poll_seconds=0.1, status_max_age=1.0).start()
+        setup = INVALIDATE + rasterproto.ESC_INIT
+        sock = h.connect()
+        sock.sendall(setup)
+        h.wait_for(lambda: h.session_bytes().endswith(setup), "the set-up bytes reached the printer")
+        start = len(h.session_bytes())
+        time.sleep(1.5)
+        self.assertEqual(h.session_bytes()[start:], b"", "no polls while a job may follow")
+        try:
+            sock.sendall(MONO[len(setup):])
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        self.assertEqual(_how_closed(sock), "rst")
+        self.assertEqual(h.state()["job"]["last_result"], "refused")
+        rest = h.session_bytes()[start:]
+        self.assertTrue(rest.startswith(STATUS_REQUEST), "one status request before the decision")
+        self.assertNotIn(PRINT_INFO, rest)
+        self.assertEqual(h.model.violations, [])
+
+    def test_a_second_job_cut_inside_its_first_command(self):
+        """After a settled job, a read that ends inside the next job's first command
+        (here half of ESC i z) keeps that command back: a refused job leaves none of
+        it with the printer, and a job that passes reaches it whole."""
+        for second, refused in ((MONO, True), (JOB, False)):
+            with self.subTest(refused=refused):
+                h = Harness(self).start()
+                cut = second.index(PRINT_INFO) + 2              # 1B 69 of ESC i z
+                sock = h.connect()
+                sock.sendall(JOB)
+                h.wait_state(lambda s: s["job"]["last_result"] == "ok" and not s["job"]["active"],
+                             "the first job printed")
+                sock.sendall(second[:cut])
+                h.wait_for(lambda: h.session_bytes().endswith(second[:cut - 2]), "the second job's set-up arrived")
+                time.sleep(0.2)
+                self.assertFalse(h.session_bytes().endswith(second[:cut]), "the cut ESC i z is kept back")
+                start = len(h.session_bytes())
+                try:
+                    sock.sendall(second[cut:])
+                    sock.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+                self.assertEqual(_how_closed(sock), "rst" if refused else "fin")
+                state = h.state()["job"]
+                rest = h.session_bytes()[start:]
+                if refused:
+                    self.assertEqual(state["last_result"], "refused")
+                    self.assertEqual(rest.replace(STATUS_REQUEST, b""), b"", "none of the job, and no resync")
+                else:
+                    self.assertEqual(state["last_result"], "ok")
+                    self.assertTrue(rest.startswith(second[cut - 2:]), "the job goes on whole, from its ESC i z")
+                    self.assertEqual(state["bytes"], len(second) - (cut - 2), "its first command counts as the job's")
+                self.assertEqual(h.model.violations, [])
+
+    def test_a_second_job_is_held_from_its_first_print_data(self):
+        # Brother's Windows driver sends ESC i U J (a job id) before ESC i z.
+        z = MONO.index(PRINT_INFO)
+        job_id = b"\x1b\x69\x55\x4a" + bytes([0x00, 0x0C] + [0] * 9 + [0x42, 0, 0])
+        second = MONO[:z] + job_id + MONO[z:]
+        h = Harness(self).start()
+        sock = h.connect()
+        sock.sendall(JOB)
+        h.wait_state(lambda s: s["job"]["last_result"] == "ok" and not s["job"]["active"], "the first job printed")
+        start = len(h.session_bytes())
+        try:
+            sock.sendall(second)
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        self.assertEqual(_how_closed(sock), "rst")
+        self.assertEqual(h.state()["job"]["last_result"], "refused")
+        rest = h.session_bytes()[start:]
+        self.assertNotIn(job_id, rest, "held from its first print data, not from ESC i z")
+        self.assertNotIn(PRINT_INFO, rest)
+        self.assertFalse(h.model.mute)
+
+    def test_a_job_that_does_not_show_its_colour_mode_soon_goes_through(self):
+        # ESC i K 08, then 20000 blank lines before the first g row, sent in two parts.
+        k = MONO.index(b"\x1b\x69\x4b") + 4
+        job = MONO[:k] + b"\x5a" * 20000 + MONO[k:]
+        h = Harness(self).start()
+        with mock.patch.object(proxyd, "_COLOR_HOLD_LIMIT", 1000):
+            h.send_job(job, pieces=2, pause=0.3)
+        self.assertEqual(h.session_bytes().count(job), 1, "past the hold limit the job goes through unchecked")
+        self.assertNotEqual(h.state()["job"]["last_result"], "refused")
+
+
+class SetupConnectionTest(unittest.TestCase):
+    """A connection with nothing but NULs and set-up commands is no job:
+    iPrint&Label for iOS sends one before each print and for Check Media."""
+
+    def test_iprint_check_is_not_a_job(self):
+        cases = {
+            "iPrint&Label": (INVALIDATE + rasterproto.ESC_INIT,        # 402 bytes, as its check
+                             "(NUL bytes 400, set-up commands 1, status requests 0)"),
+            "more set-up": (INVALIDATE + rasterproto.ESC_INIT + b"\x1b\x69\x61\x01\x1b\x69\x21\x00"
+                            + STATUS_REQUEST, "(NUL bytes 400, set-up commands 3, status requests 1)"),
+        }
+        for name, (check, contents) in cases.items():
+            with self.subTest(name):
+                h = Harness(self).start()
+                h.send_job(JOB)
+                before = h.state()["job"]
+                start = len(h.session_bytes())
+                with self.assertLogs("ql810wc.proxyd", "INFO") as logs:
+                    sock = h.connect()
+                    sock.sendall(check)
+                    sock.shutdown(socket.SHUT_WR)
+                    self.assertEqual(_how_closed(sock), "fin", "an ordinary close")
+                self.assertEqual(h.state()["job"], before, "the last job stays the last job")
+                self.assertTrue(any(f"{len(check)} bytes, no print job {contents}" in line for line in logs.output),
+                                logs.output)
+                self.assertFalse(any("middle of a job" in line for line in logs.output), logs.output)
+                _wait_polls(h, start + len(check), 1)
+                self.assertEqual(h.session_bytes()[start:].replace(STATUS_REQUEST, b""),
+                                 check.replace(STATUS_REQUEST, b""),
+                                 "forwarded as sent, and no resync after it")
+                self.assertEqual(h.model.violations, [], "the polls after it are no status requests inside a job")
+
+    def test_a_set_up_command_cut_between_two_reads_is_still_no_job(self):
+        h = Harness(self).start()
+        h.send_job(JOB)
+        before = h.state()["job"]
+        check = INVALIDATE + rasterproto.ESC_INIT
+        start = len(h.session_bytes())
+        sock = h.connect()
+        sock.sendall(check[:-1])                            # ... 00 1B
+        h.wait_for(lambda: h.session_bytes().endswith(INVALIDATE), "the NULs reached the printer")
+        time.sleep(0.2)
+        self.assertFalse(h.session_bytes().endswith(check[:-1]), "half an ESC @ is kept back")
+        sock.sendall(check[-1:])                            # 40
+        sock.shutdown(socket.SHUT_WR)
+        self.assertEqual(_how_closed(sock), "fin")
+        self.assertEqual(h.state()["job"], before, "no job recorded")
+        _wait_polls(h, start + len(check), 1)
+        self.assertEqual(h.session_bytes()[start:].replace(STATUS_REQUEST, b""), check, "then forwarded whole")
+        self.assertEqual(h.model.violations, [])
+
+    def test_an_incomplete_command_at_the_end_is_not_sent(self):
+        h = Harness(self).start()
+        h.send_job(JOB)
+        before = h.state()["job"]
+        start = len(h.session_bytes())
+        with self.assertLogs("ql810wc.proxyd", "INFO") as logs:
+            self.assertEqual(h.send_job(INVALIDATE + b"\x1b\x69"), b"")
+        self.assertTrue(any("402 bytes, no print job" in line
+                            and "the last 2 bytes, an incomplete command, were not sent" in line
+                            for line in logs.output), logs.output)
+        self.assertEqual(h.state()["job"], before)
+        _wait_polls(h, start + len(INVALIDATE), 1)
+        self.assertEqual(h.session_bytes()[start:].replace(STATUS_REQUEST, b""), INVALIDATE,
+                         "no half command, so no resync")
+
+    def test_an_incomplete_command_after_a_job_is_not_sent(self):
+        h = Harness(self).start()
+        sock = h.connect()
+        sock.sendall(JOB)
+        h.wait_state(lambda s: s["job"]["last_result"] == "ok" and not s["job"]["active"], "the job printed")
+        start = len(h.session_bytes())
+        with self.assertLogs("ql810wc.proxyd", "INFO") as logs:
+            sock.sendall(PTOUCH_TRAILER[:5])               # ESC i U t, one byte short
+            sock.shutdown(socket.SHUT_WR)
+            self.assertEqual(_how_closed(sock), "fin")
+        self.assertNotIn(PTOUCH_TRAILER[:5], h.session_bytes()[start:])
+        self.assertTrue(any("the last 5 bytes after its job, an incomplete command, were not sent" in line
+                            for line in logs.output), logs.output)
+        self.assertFalse(any("5-byte trailer" in line for line in logs.output), logs.output)
+
+    def test_a_trailer_cut_inside_a_command_is_forwarded_whole(self):
+        h = Harness(self).start()
+        sock = h.connect()
+        sock.sendall(JOB)
+        h.wait_state(lambda s: s["job"]["last_result"] == "ok" and not s["job"]["active"], "the job printed")
+        sock.sendall(PTOUCH_TRAILER[:3])                   # 1B 69 55
+        time.sleep(0.2)
+        self.assertFalse(h.session_bytes().endswith(PTOUCH_TRAILER[:3]), "kept back until it is complete")
+        sock.sendall(PTOUCH_TRAILER[3:])
+        h.wait_for(lambda: PTOUCH_TRAILER in h.session_bytes(), "the whole trailer reached the printer")
+        sock.shutdown(socket.SHUT_WR)
+        self.assertEqual(_how_closed(sock), "fin")
+        self.assertEqual(h.state()["job"]["last_result"], "ok")
+        self.assertEqual(h.model.violations, [])
+
+    def test_no_status_poll_while_set_up_commands_wait_for_a_job(self):
+        h = Harness(self, poll_seconds=0.1).start()
+        setup = INVALIDATE + rasterproto.ESC_INIT
+        sock = h.connect()
+        sock.sendall(setup)
+        h.wait_for(lambda: h.session_bytes().endswith(setup), "the set-up bytes reached the printer")
+        start = len(h.session_bytes())
+        time.sleep(0.5)
+        self.assertEqual(h.session_bytes()[start:], b"", "no status request while a job may follow")
+        sock.sendall(JOB[len(setup):])
+        sock.shutdown(socket.SHUT_WR)
+        _recv_until_closed(sock)
+        self.assertEqual(h.state()["job"]["last_result"], "ok")
+        self.assertEqual(h.state()["job"]["bytes"], len(JOB), "the set-up bytes count as the job's")
+        self.assertEqual(h.session_bytes().count(JOB), 1)
+        self.assertEqual(h.model.violations, [])
+
+
 def _printer(model: PrinterModel) -> FakePrinter:
     return FakePrinter(model)
 
@@ -792,8 +1160,11 @@ class StatusTest(unittest.TestCase):
             sock.shutdown(socket.SHUT_WR)
         except OSError:
             pass
-        self.assertEqual(_recv_until_closed(sock), b"")
-        h.wait_state(lambda s: s["job"]["last_result"] == "error", "job refused")
+        with self.assertLogs("ql810wc.proxyd", "WARNING") as logs:
+            self.assertEqual(_recv_until_closed(sock), b"")
+            h.wait_state(lambda s: s["job"]["last_result"] == "error", "job turned away")
+        self.assertTrue(any("turned away a print job from 127.0.0.1:" in line and "printer not available" in line
+                            for line in logs.output), logs.output)
         self.assertEqual(h.printer.total_written, written, "nothing reaches the printer")
         h.bus.set_editor_lite(False)
         h.wait_state(lambda s: s["device"]["state"] == "ready", "printer mode again")
@@ -1068,6 +1439,14 @@ class SegmentTest(unittest.TestCase):
         self.assertFalse(seg.has_job_content())
         self.assertTrue(seg.at_rest)
 
+    def test_set_up_commands_alone_are_not_a_job(self):
+        seg = proxyd._Segment()
+        seg.observe(INVALIDATE + rasterproto.ESC_INIT + b"\x1b\x69\x61\x01")
+        self.assertFalse(seg.has_job_content())
+        self.assertFalse(seg.at_rest, "a job may follow: no status requests in between")
+        seg.observe(PRINT_INFO + b"\x86\x0a\x3e\x00" + bytes(6))
+        self.assertTrue(seg.has_job_content())
+
     def test_a_trailer_that_ends_in_esc_i_a_ff_leaves_the_stream_at_rest(self):
         """Behind P-touch's trailer the stream stands at a command boundary until
         anything follows it; then it can no longer be judged."""
@@ -1165,15 +1544,20 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.state_path, statecache.DEFAULT_PATH)
         self.assertFalse(settings.bidirectional)
         self.assertEqual(settings.device, "auto")
+        self.assertTrue(settings.color_check)
+        self.assertEqual(settings.status_max_age, 60.0)
+        self.assertEqual((ProxySettings().color_check, ProxySettings().status_max_age), (True, 60.0))
 
     def test_values_and_overrides(self):
         cfg = config.load_runtime_config(None)
         cfg.update(RAW_PORT="9101", RAW_BIND="192.0.2.10", RAW_BIDIRECTIONAL="yes", STATUS_POLL_SECONDS="5",
                    RAW_IDLE_TIMEOUT="120", MAX_JOB_BYTES="1048576", USB_PRODUCT_ID="209C",
-                   STATE_FILE="/tmp/x.json")
+                   STATE_FILE="/tmp/x.json", RAW_COLOR_CHECK="no", STATUS_MAX_AGE_SECONDS="90")
         settings = ProxySettings.from_config(cfg, listen=("127.0.0.1", 0), device="/dev/usb/lp1")
         self.assertEqual(settings.listen, ("127.0.0.1", 0))
         self.assertTrue(settings.bidirectional)
+        self.assertFalse(settings.color_check)
+        self.assertEqual(settings.status_max_age, 90.0)
         self.assertEqual(settings.poll_seconds, 5.0)
         self.assertEqual(settings.raw_idle_timeout, 120.0)
         self.assertEqual(settings.write_stall_timeout, 120.0)
@@ -1184,7 +1568,8 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(ProxySettings.from_config(cfg).listen, ("192.0.2.10", 9101))
 
     def test_invalid_values(self):
-        for key, value in (("RAW_IDLE_TIMEOUT", "1"), ("RAW_IDLE_TIMEOUT", "soon"), ("MAX_JOB_BYTES", "100")):
+        for key, value in (("RAW_IDLE_TIMEOUT", "1"), ("RAW_IDLE_TIMEOUT", "soon"), ("MAX_JOB_BYTES", "100"),
+                           ("RAW_COLOR_CHECK", "maybe")):
             with self.subTest(key=key, value=value):
                 cfg = config.load_runtime_config(None)
                 cfg[key] = value

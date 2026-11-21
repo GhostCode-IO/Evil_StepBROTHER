@@ -458,11 +458,18 @@ class TokenizerTest(unittest.TestCase):
 
     def test_every_prefix_is_judged_correctly(self):
         job = driver_like_job()
+        # NUL padding, then the set-up commands ESC @, ESC i a 01 and ESC i ! 01:
+        # right behind each of them the printer is at a command boundary, no job open.
+        setup_ends = {len(rp.INVALIDATE) + 2, len(rp.INVALIDATE) + 6, len(rp.INVALIDATE) + 10}
+        self.assertEqual(job[len(rp.INVALIDATE):max(setup_ends)], b"\x1b\x40\x1b\x69\x61\x01\x1b\x69\x21\x01")
         tok = rp.RasterTokenizer()
         for i in range(len(job) - 1):
             tok.feed(job[i:i + 1])
             if i < len(rp.INVALIDATE):
                 self.assertFalse(tok.needs_resync, "NUL padding alone is harmless")
+            elif i + 1 in setup_ends:
+                self.assertFalse(tok.needs_resync, f"a {i + 1}-byte prefix ends with a set-up command")
+                self.assertFalse(tok.in_job)
             else:
                 self.assertTrue(tok.needs_resync, f"a {i + 1}-byte prefix leaves the printer mid-job")
         tok.feed(job[-1:])
@@ -528,12 +535,127 @@ class TokenizerTest(unittest.TestCase):
         tok.feed(rp.make_test_job(rows=150))
         tok.feed(rp.INVALIDATE + rp.ESC_INIT + b"\x1b\x69\x61\x01")
         self.assertEqual(tok.jobs, 1)
-        self.assertTrue(tok.in_job)
-        self.assertFalse(tok.job_ended)
-        self.assertTrue(tok.needs_resync)
+        self.assertFalse(tok.in_job, "set-up commands start no job")
+        self.assertTrue(tok.job_ended)
+        self.assertFalse(tok.needs_resync)
         self.assertFalse(tok.two_color, "ESC @ resets the job modes")
         self.assertIsNone(tok.requested_media)
         self.assertEqual(tok.command_mode, 0x01)
+        tok.feed(b"\x1b\x69\x7a\x86\x0a\x3e\x00" + (150).to_bytes(4, "little") + b"\x00\x00")
+        self.assertTrue(tok.in_job, "ESC i z starts the next job")
+        self.assertFalse(tok.job_ended)
+        self.assertTrue(tok.needs_resync)
+        self.assertEqual(tok.requested_media["width"], 62)
+
+    def test_setup_commands_alone_are_no_job(self):
+        """iPrint&Label for iOS opens a 402-byte connection before each print and
+        for Check Media (presumably 400 NULs and ESC @, not captured): the
+        printer is left at a command boundary, with no job open."""
+        cases = {
+            "iPrint&Label check": rp.INVALIDATE + rp.ESC_INIT,
+            "raster mode": rp.INVALIDATE + rp.ESC_INIT + b"\x1b\x69\x61\x01",
+            "notifications": rp.ESC_INIT + b"\x1b\x69\x21\x00" + b"\x1b\x69\x21\x01",
+            "status request": rp.INVALIDATE + rp.ESC_INIT + b"\x1b\x69\x61\x01" + rp.STATUS_REQUEST,
+            "the proxy's resync": rp.RESYNC + rp.STATUS_REQUEST,
+        }
+        for name, stream in cases.items():
+            with self.subTest(name):
+                tok = rp.RasterTokenizer()
+                events = tok.feed(stream)
+                self.assertFalse(tok.in_job)
+                self.assertFalse(tok.job_ended)
+                self.assertFalse(tok.needs_resync)
+                self.assertTrue(tok.at_command_boundary)
+                self.assertEqual(tok.jobs, 0)
+                self.assertFalse(tok.color_decided)
+                self.assertEqual(tok.setup_commands,
+                                 sum(1 for e in events if e.kind in ("init", "command_mode", "auto_status")))
+                self.assertGreater(tok.setup_commands, 0)
+        tok = rp.RasterTokenizer()
+        tok.feed(rp.INVALIDATE + rp.ESC_INIT[:1])
+        self.assertTrue(tok.needs_resync, "half an ESC @ leaves the printer mid-command")
+        tok = rp.RasterTokenizer()
+        tok.feed(rp.ESC_INIT + b"\x1b\x69\x61\x03")
+        self.assertIsNotNone(tok.opaque, "another command mode is still no set-up command")
+        self.assertTrue(tok.in_job)
+
+    def test_requested_color(self):
+        """The colour mode a job asks for: its ESC i K bit 0, decided at the first
+        g/w raster row (which must agree) or, without one, at the first print command."""
+        mono = rp.make_test_job(two_color=False, rows=150)
+        two = rp.make_test_job(rows=150)
+        head = mono[:mono.index(b"\x1b\x69\x4b")]            # up to ESC i K
+        row_g = b"\x67\x00\x02\xff\x00"
+        row_w = b"\x77\x01\x02\xff\x00" + b"\x77\x02\x02\x00\x00"
+        k = {True: b"\x1b\x69\x4b\x09", False: b"\x1b\x69\x4b\x08"}
+        cases = {
+            "two-colour test job": (two, True),
+            "black-only test job": (mono, False),
+            "Windows driver shape": (driver_like_job(), True),
+            "ESC i K two-colour, g rows": (head + k[True] + row_g + b"\x1a", None),
+            "ESC i K black, w rows": (head + k[False] + row_w + b"\x1a", None),
+            "no ESC i K, g rows": (head + row_g + b"\x1a", None),
+            "no ESC i K, w rows": (head + row_w + b"\x1a", None),
+            "blank black-only page": (head + k[False] + b"\x5a" * 20 + b"\x1a", False),
+            "blank two-colour page": (head + k[True] + b"\x5a" * 20 + b"\x0c", True),
+            "ESC @ clears ESC i K": (head + k[False] + rp.ESC_INIT + row_g + b"\x1a", None),
+            "the first row decides": (head + k[False] + row_g + k[True] + row_w + b"\x1a", False),
+        }
+        for name, (stream, expected) in cases.items():
+            with self.subTest(name):
+                tok = rp.RasterTokenizer()
+                tok.feed(stream)
+                self.assertTrue(tok.color_decided)
+                self.assertIs(tok.requested_two_color, expected)
+                self.assertEqual(tok.summary()["requested_two_color"], expected)
+        tok = rp.RasterTokenizer()
+        tok.feed(head + k[False] + b"\x4d\x02" + b"\x5a" * 5)
+        self.assertFalse(tok.color_decided, "no raster row and no print command yet")
+        self.assertIsNone(tok.requested_two_color)
+        tok.feed(row_g[:2])
+        self.assertFalse(tok.color_decided, "a row decides once its header is complete")
+        tok.feed(row_g[2:])
+        self.assertIs(tok.requested_two_color, False)
+
+    def test_partial_command(self):
+        """The bytes of the command a stream stops in (proxyd keeps them back while
+        no job has started)."""
+        job = rp.make_test_job(rows=150)
+        z = job.index(b"\x1b\x69\x7a")
+        cases = {
+            b"": b"",
+            rp.INVALIDATE: b"",
+            rp.INVALIDATE + b"\x1b": b"\x1b",
+            rp.ESC_INIT + b"\x1b\x69\x61": b"\x1b\x69\x61",
+            job[:z + 5]: job[z:z + 5],
+            job[:-1]: b"",                                  # at a command boundary, in the job
+            job[:-50]: b"",                                 # inside a raster row's payload
+            rp.ESC_INIT + b"\x1b\x69\x58" + b"\x1b": b"",     # opaque
+        }
+        for stream, expected in cases.items():
+            with self.subTest(stream=stream[-6:].hex(" ")):
+                tok = rp.RasterTokenizer()
+                tok.feed(stream)
+                self.assertEqual(tok.partial_command, expected)
+        tok = rp.RasterTokenizer()
+        steps = ((z + 1, job[z:z + 1]), (1, job[z:z + 2]), (11, b""),   # ESC i z, byte by byte, then whole
+                 (2, b"\x1b\x69"), (2, b""))                          # half of ESC i M, then all of it
+        for size, expected in steps:
+            tok.feed(job[tok.bytes_seen:tok.bytes_seen + size])
+            self.assertEqual(tok.partial_command, expected, f"after {tok.bytes_seen} bytes")
+
+    def test_requested_color_is_per_job(self):
+        tok = rp.RasterTokenizer()
+        tok.feed(rp.make_test_job(rows=150))
+        self.assertIs(tok.requested_two_color, True)
+        tok.feed(rp.INVALIDATE + rp.ESC_INIT)
+        self.assertIs(tok.requested_two_color, True, "kept until the next job's content starts")
+        tok.feed(rp.make_test_job(two_color=False, rows=150)[len(rp.INVALIDATE) + 2:])
+        self.assertIs(tok.requested_two_color, False)
+        tok = rp.RasterTokenizer()
+        tok.feed(rp.ESC_INIT + b"\x1b\x69\x4b\x08" + b"\x1b\x69\x58\x00" + b"\x67\x00\x01\x00\x1a")
+        self.assertIsNotNone(tok.opaque)
+        self.assertFalse(tok.color_decided, "nothing is decided once the stream is opaque")
 
     def test_media_block(self):
         record = b"\x01" + bytes(range(127))
@@ -664,7 +786,8 @@ class TokenizerTest(unittest.TestCase):
 
     def test_esc_i_u_t_inside_a_job_does_not_end_it(self):
         tok = rp.RasterTokenizer()
-        tok.feed(rp.INVALIDATE + rp.ESC_INIT + b"\x1b\x69\x61\x01" + PTOUCH_TRAILER[:6])
+        tok.feed(rp.INVALIDATE + rp.ESC_INIT + b"\x1b\x69\x61\x01" + b"\x1b\x69\x4d\x40"
+                 + PTOUCH_TRAILER[:6])
         self.assertIsNone(tok.opaque)
         self.assertTrue(tok.in_job)
         self.assertFalse(tok.job_ended)

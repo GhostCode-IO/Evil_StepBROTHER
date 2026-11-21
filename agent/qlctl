@@ -36,7 +36,7 @@ import shutil  # noqa: E402
 import socket  # noqa: E402
 import subprocess  # noqa: E402
 import time  # noqa: E402
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple  # noqa: E402
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple  # noqa: E402
 
 from ql810wc import __version__, config, media, rasterproto, statecache, usbio  # noqa: E402
 from ql810wc.proxyd import format_peer, mask_serial  # noqa: E402
@@ -159,6 +159,8 @@ def _print_status(doc: Mapping[str, Any], summary: Mapping[str, Any], path: str)
         two = {True: "two-color", False: "mono"}.get(job.get("two_color"), "colour unknown")
         print(f"Job       last: {job['last_result']}, from {job.get('peer')}, {job.get('bytes', 0)} bytes, "
               f"{two}, {_ago(age_seconds(doc, 'job.last_finished'))} ago")
+        if job.get("last_detail"):
+            print(f"          {job['last_detail']}")
     else:
         print("Job       none yet")
 
@@ -219,13 +221,17 @@ def _check_roll(frame: Optional[rasterproto.Status], two_color: bool,
     return None
 
 
-def _send_job(host: str, port: int, job: bytes, timeout: float) -> Tuple[float, str]:
+def _send_job(host: str, port: int, job: bytes, timeout: float,
+              peer: Optional[List[str]] = None) -> Tuple[float, str]:
     """Send a job, half-close, wait for the proxy to close (delivery).
     Returns (seconds until the close, our address as the proxy reports its
-    peer); raises OSError / socket.timeout."""
+    peer); raises OSError / socket.timeout. ``peer``, if given, receives our
+    address as soon as the connection is up (for a job the proxy refuses)."""
     started = time.monotonic()
     with socket.create_connection((host, port), timeout=min(10.0, timeout)) as sock:
         local = format_peer(sock.getsockname())
+        if peer is not None:
+            peer.append(local)
         sock.settimeout(timeout)
         sock.sendall(job)
         sock.shutdown(socket.SHUT_WR)
@@ -268,13 +274,21 @@ def cmd_test_print(args: argparse.Namespace, cfg: config.RuntimeConfig) -> int:
     kind = "two-color" if two_color else "mono"
     rows = args.rows or rasterproto.DEFAULT_TEST_LINES
     started = time.time()
+    peer: List[str] = []
     try:
-        elapsed, local = _send_job(host, port, job, args.timeout)
+        elapsed, local = _send_job(host, port, job, args.timeout, peer)
     except socket.timeout:
         _err(f"sent {len(job)} bytes to {host}:{port}, but the proxy did not confirm delivery "
              f"within {args.timeout:.0f} s")
         return EXIT_FAIL
     except OSError as exc:
+        # ql810wc-proxyd records a job it refuses (RAW_COLOR_CHECK) before it resets the client.
+        after = statecache.StateCache(path).read()
+        finished = get_path(after, "job.last_finished")
+        if (peer and get_path(after, "job.peer") == peer[0] and get_path(after, "job.last_result") == "refused"
+                and isinstance(finished, (int, float)) and finished >= started - 1):
+            _err(f"ql810wc-proxyd refused the test label: {get_path(after, 'job.last_detail')}")
+            return EXIT_REFUSED
         _err(f"cannot send the test label to {host}:{port}: {exc}")
         return EXIT_FAIL
     print(f"sent {len(job)} bytes ({kind}, {args.pattern}, {width} mm, {rows} rows) to {host}:{port}; "
@@ -287,6 +301,8 @@ def cmd_test_print(args: argparse.Namespace, cfg: config.RuntimeConfig) -> int:
         result = get_path(after, "job.last_result")
         detail = get_path(after, "job.last_detail")
         print(f"printer result: {result}" + (f" ({detail})" if detail else ""))
+        if result == "refused":
+            return EXIT_REFUSED
         if result != "ok":
             return EXIT_FAIL
     else:

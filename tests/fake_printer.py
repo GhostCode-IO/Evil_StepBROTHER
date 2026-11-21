@@ -7,7 +7,10 @@
   phase-change / printing-completed / error frames a real QL sends after a
   job's ``0x1A``, and records everything for assertions: every byte, every
   status request and every ``ESC i S`` that arrived while a job was in
-  flight (:attr:`PrinterModel.violations`).
+  flight (:attr:`PrinterModel.violations`). It rejects a job whose colour
+  mode the roll cannot print, and after a black-only job on DK-22251 it
+  answers nothing until :meth:`PrinterModel.power_cycle`, as the tested unit
+  did.
 * :class:`FakePrinter` - an in-process :class:`ql810wc.usbio.Transport` on
   top of a model, with slow writes, stalls, a last transfer that never
   completes, early empty reads and unplugging.
@@ -54,9 +57,10 @@ PTOUCH_TRAILER = b"\x1b\x69\x55\x74\x1c\x00" + b"\x1b\x69\x61\xff"
 #: What the proxy sends to resynchronise the printer before a status request.
 RESYNC_REQUEST = RESYNC + STATUS_REQUEST
 
-_JOB_START_EVENTS = frozenset({"command_mode", "auto_status", "print_info", "various_mode", "cut_every",
-                               "expanded_mode", "margin", "esc_i_j", "job_id", "media_block",
-                               "compression", "print"})
+#: Commands that open a job on the printer. ESC i a 01/FF and ESC i ! only set a
+#: mode (another ESC i a value opens a job: what follows is not raster).
+_JOB_START_EVENTS = frozenset({"print_info", "various_mode", "cut_every", "expanded_mode", "margin",
+                               "esc_i_j", "job_id", "media_block", "compression", "print"})
 
 
 class PrinterModel:
@@ -67,6 +71,8 @@ class PrinterModel:
     in the stream turns it off, ``ESC i ! 00`` on). ``print_seconds``: how
     long a label takes to print. ``mute``: never answer ``ESC i S``.
     ``fail_next_job = (err1, err2)``: the next job ends in an error frame.
+    ``error_detail``: byte 31 of the frames (a colour-mismatch code; see
+    :meth:`_color_mismatch`).
     """
 
     def __init__(self, status: bytes = IDLE_DK22251, *, notify: bool = True,
@@ -79,6 +85,7 @@ class PrinterModel:
         self.print_seconds = print_seconds
         self.reply_delay = 0.0
         self.mute = False
+        self.error_detail = 0
         self.after_reply: Optional[bytes] = None           # a frame sent right behind the next reply
         self.fail_next_job: Optional[Tuple[int, int]] = None
         self.received = bytearray()
@@ -106,6 +113,7 @@ class PrinterModel:
         with self._lock:
             out = bytearray(self.base)
             out[8], out[9] = self.err1, self.err2
+            out[31] = self.error_detail
             out[18] = status_type
             if phase is None:
                 phase = PHASE_PRINTING if self.printing else PHASE_RECEIVING
@@ -152,6 +160,17 @@ class PrinterModel:
     def clear_errors(self) -> None:
         with self._lock:
             self.err1 = self.err2 = 0
+            self.error_detail = 0
+
+    def power_cycle(self) -> None:
+        """Switch the printer off and on: errors, a held job and muteness are gone."""
+        with self._lock:
+            self.clear_errors()
+            self.mute = False
+            self._job_start = None
+            self._two_color = False
+            self._printing_until = 0.0
+            self._out.clear()
 
     # -- receiving -----------------------------------------------------------
     def feed(self, data: bytes) -> None:
@@ -183,7 +202,7 @@ class PrinterModel:
             if self._job_start is not None:
                 self.violations.append(offset)
             if not self.mute:
-                status_type = ST_ERROR if (self.err1 or self.err2) else ST_REPLY
+                status_type = ST_ERROR if (self.err1 or self.err2 or self.error_detail) else ST_REPLY
                 self._schedule(self.frame(status_type), now + self.reply_delay)
                 if self.after_reply is not None:
                     self._schedule(self.after_reply, now + self.reply_delay)
@@ -196,15 +215,29 @@ class PrinterModel:
             self._out = [item for item in self._out if not item[3]]
         elif kind == "print_last":
             self._end_job(offset, now)
-        elif kind in _JOB_START_EVENTS:
-            if kind == "auto_status" and params:
+        elif kind == "auto_status":
+            if params:
                 self.notify = params[0] == 0x00
+        elif kind == "command_mode":
+            if params not in (b"\x01", b"\xff") and self._job_start is None:
+                self._job_start = offset           # not raster: what follows is a job of its own kind
+        elif kind in _JOB_START_EVENTS:
             if kind == "expanded_mode" and params:
                 self._two_color = bool(params[0] & 0x01)
-            if kind == "command_mode" and params == b"\xff":
-                return                             # ESC i a FF ends P-touch's trailer: no job starts
             if self._job_start is None:
                 self._job_start = offset
+
+    def _color_mismatch(self) -> int:
+        """The error code the printer reports for the job that just ended:
+        ``0x24`` ("media does not support monochrome printing") for a
+        black-only job on a black/red roll (byte 25 ``0x81``), ``0x23`` for a
+        two-colour job on a single-colour roll (``0x01``), else 0."""
+        roll = self.base[25]
+        if roll == 0x81 and not self._two_color:
+            return 0x24
+        if roll == 0x01 and self._two_color:
+            return 0x23
+        return 0
 
     def _end_job(self, offset: int, now: float) -> None:
         start = self._job_start if self._job_start is not None else offset
@@ -213,6 +246,16 @@ class PrinterModel:
         job: Dict[str, Any] = {"start": start, "end": offset + 1, "two_color": self._two_color,
                                "ended_at": now, "done_at": done, "failed": False}
         self.jobs.append(job)
+        mismatch = self._color_mismatch()
+        if mismatch:
+            # Nothing prints. The tested unit, after a black-only job on DK-22251,
+            # answers no status request until it is switched off and on.
+            job["failed"] = True
+            self.error_detail = mismatch
+            self._schedule(self.frame(ST_ERROR, PHASE_RECEIVING), now)
+            if mismatch == 0x24:
+                self.mute = True
+            return
         self._printing_until = done
         if self.notify:
             self._schedule(self.frame(ST_PHASE_CHANGE, PHASE_PRINTING), now, cancellable=True)

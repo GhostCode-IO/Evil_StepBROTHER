@@ -110,11 +110,41 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
   binds the port itself when not socket-activated (development). Connections
   are served **one at a time**; others wait in the listen backlog (TCP
   back-pressure, as on the real printer).
-- **Forwarding:** bytes from the client are written to the printer unmodified
-  and in order. The stream is tokenized **for observation only** (job end
+- **Forwarding:** bytes from the client reach the printer unmodified and in
+  order, or not at all. The stream is tokenized but never modified (job end
   `0x1A`, two-color bit in `ESC i K`, requested media in `ESC i z`, embedded
-  `ESC i S`). Unknown opcodes switch the tokenizer to "opaque" and forwarding
-  continues.
+  `ESC i S`). What the tokenizer sees decides when bytes go out and which
+  never do: the bytes held back for a job's colour check, when the check
+  refuses the job or the connection ends before the job shows its colour
+  mode, and an incomplete command a connection ends in outside a job (see
+  **Colour check**, **Trailer handling** and **Set-up commands** below).
+  Unknown opcodes switch the tokenizer to "opaque" and forwarding continues.
+- **Colour check** (`RAW_COLOR_CHECK`, default `yes`): a job's print data
+  (everything from its first command that is not NUL padding, a set-up or a
+  post-job command) is held back, with the rest of the read it starts in,
+  until the job shows its colour mode. That is at its first `g` or `w` raster
+  row (or, without one, its first print command): bit 0 of its last
+  `ESC i K`, as long as the row agrees (`w` with the bit set, `g` without).
+  Brother's QL-810W driver for macOS sends `ESC i K 0a` and `g` rows for
+  Monochrome, `ESC i K 0b` and `w` rows for 2-Color (its own filter, run on a
+  Mac; see `dev/notes/README.md`). When a status frame from the last
+  `STATUS_MAX_AGE_SECONDS` (asked for at that moment if the last one is older
+  and the printer's input state is known) shows a black/red roll (byte 25
+  `0x81`) and the job is black only, or a single-colour roll (`0x01`) and the
+  job is two-colour, the job is refused: none of its print data reaches the
+  printer, `state.json` records `refused`, and the client gets a RST once
+  that is written. The printer itself rejects such a job ("media does not
+  support monochrome printing"; "... two-color printing" per Brother's SDK
+  **(unverified)**), and the tested unit, after a black-only job on DK-22251,
+  answered no status request until it was switched off and on. Anything
+  uncertain goes through unchecked: no `ESC i K`, a row that contradicts it,
+  a stream that turns opaque before the job shows its mode, no recent frame,
+  no roll, another byte-25 value, or 256 KiB held before the job shows its
+  mode (no `g` or `w` row and no print command yet; `Z` blank lines do not
+  count). A job that ends while it is held back sent no print data to the
+  printer, so its end never calls for a resync. Over raw TCP the RST is all a
+  client learns: macOS's CUPS backend shows the job as completed when the RST
+  arrives after its last write.
 - **Connection lifecycle:** close **only** after the client half-closes (EOF)
   or after `RAW_IDLE_TIMEOUT` seconds without data (default 300). **Never close
   on a timer after `0x1A`.** P-touch for Mac sends a trailer on the same
@@ -123,11 +153,13 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
   Static analysis of MacPrintSDK shows this.
 - **Trailer handling:** bytes that arrive after a `0x1A` at a command boundary
   belong to that job. **Hold them** until the post-job USB poll shows the phase
-  back at "receiving", then forward them verbatim. Never drop them, never
-  resync on them, never count them as a torn job. (P-touch also writes a bare
-  `ESC i S` here on its PRN/template paths; it is held and forwarded the same
-  way.) Per-connection state: `IDLE → WRITING → SETTLING (after 0x1A: trailer
-  held, post-job polls) → IDLE`.
+  back at "receiving", then forward them verbatim, except a command the
+  connection ends in before it is complete: like any incomplete command
+  outside a job, it is kept back and then dropped (see **Set-up commands**).
+  Never resync on them, never count them as a torn job. (P-touch also writes
+  a bare `ESC i S` here on its PRN/template paths; it is held and forwarded
+  the same way.) Per-connection state: `IDLE → CHECKING (colour check) → WRITING →
+  SETTLING (after 0x1A: trailer held, post-job polls) → IDLE`.
 - **Limits:** `SO_KEEPALIVE` with short timers, `RAW_IDLE_TIMEOUT` (300 s) and
   `MAX_JOB_BYTES` (16 MiB), both settable in `config.env`. One silent client
   must not block later jobs.
@@ -152,8 +184,10 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
 - **Torn jobs:** a job is torn **only** on abnormal termination before its
   `0x1A`: RST/error, `RAW_IDLE_TIMEOUT` or `MAX_JOB_BYTES`. Parser state alone
   (for example an "opaque" stream) never makes a job torn. Recovery is
-  400×`0x00` + `ESC @` to resynchronise the printer. The real printer would
-  stay BUSY until power-cycled. A torn job may print a partial label first.
+  400×`0x00` + `ESC @` to resynchronise the printer (not needed for a job
+  still held back for the colour check, which sent no print data). The real
+  printer would stay BUSY until power-cycled. A torn job may print a partial
+  label first.
 - **Tokenizer extras:** `ESC i U t` + 2 bytes (from P-touch's trailer;
   provisional length), alongside `ESC i U J` + 14 and `ESC i U w` + 128.
 - **Post-job commands:** `ESC i S`, `ESC i U t` + 2 and `ESC i a FF` are not
@@ -168,6 +202,28 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
   until that connection closes. A connection held open like that for longer
   than `STATUS_MAX_AGE_SECONDS` makes the persona report the printer as
   switched off until it closes (P-touch closes about 1 s after its trailer).
+- **Set-up commands:** `ESC @`, `ESC i a 01` and `ESC i !` are not job
+  content either. A connection with nothing but NULs, set-up commands and
+  `ESC i S` is no job. iPrint&Label for iOS opens a 402-byte connection of
+  its own before each print and for Check Media; 400 NULs and `ESC @` fit
+  that size, but its content was not captured. Such bytes are forwarded, the
+  printer is left at a command boundary and is not resynchronised, and the
+  journal line `connection from …: <n> bytes, no print job (NUL bytes …,
+  set-up commands …, status requests …)` counts what it held. While no job
+  is open on a connection (before its first job, and in a settled job's
+  trailer until the next job starts), a read that ends inside a command
+  keeps that command back until it is complete (and drops it, with a journal
+  line, if the connection ends first), so where a read ends never leaves the
+  printer waiting inside a command. After a settled job the next job starts
+  at its first print-data command, which need not be its `ESC i z` (an
+  `ESC i U J` may come first), so the colour check holds it from that
+  command, with the rest of the read it starts in. NULs and set-up commands
+  that arrived in an earlier read were forwarded already and count as the
+  previous job's trailer. While
+  set-up commands wait on an open connection for a job, the idle polls
+  pause, as during a job; held open for longer than
+  `STATUS_MAX_AGE_SECONDS`, such a connection makes the persona report the
+  printer as switched off until its status is read again.
 - **Status polling:** never during a job. Idle: every `STATUS_POLL_SECONDS`
   send `ESC i S` and read the 32-byte reply. The request is preceded by
   400×`0x00` + `ESC @` only while the printer's input state is unknown: at
@@ -242,7 +298,7 @@ or unparseable files as "printer unknown".
                "media_length_mm": 0, "two_color": true, "errors": [], "...": "..."}
   },
   "job": {"active": false, "peer": null, "started": null, "bytes": 0,
-          "two_color": null, "last_result": "ok | error | torn | null",
+          "two_color": null, "last_result": "ok | error | torn | refused | null",
           "last_finished": null}
 }
 ```

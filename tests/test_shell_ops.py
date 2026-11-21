@@ -918,7 +918,8 @@ class RuntimeEnvDerivedTest(OpsTestCase):
         script = r'''
 source "$REPO/scripts/lib/common.sh"
 STATUS_POLL_SECONDS="$1" LOG_LEVEL="$2" RAW_BIDIRECTIONAL=On USB_PRODUCT_ID=209C MAX_JOB_BYTES=0065536
-for k in STATUS_MAX_AGE_SECONDS LOG_LEVEL RAW_BIDIRECTIONAL USB_PRODUCT_ID MAX_JOB_BYTES; do
+RAW_COLOR_CHECK=Off
+for k in STATUS_MAX_AGE_SECONDS LOG_LEVEL RAW_BIDIRECTIONAL USB_PRODUCT_ID MAX_JOB_BYTES RAW_COLOR_CHECK; do
   printf '%s=%s\n' "$k" "$(qlp_runtime_value "$k")"
 done
 for p in 0 1 30 31 60 61 x; do printf 'age(%s)=%s\n' "$p" "$(qlp_status_max_age "$p")"; done
@@ -927,13 +928,42 @@ for p in 0 1 30 31 60 61 x; do printf 'age(%s)=%s\n' "$p" "$(qlp_status_max_age 
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout.splitlines(), [
             "STATUS_MAX_AGE_SECONDS=90", "LOG_LEVEL=WARNING", "RAW_BIDIRECTIONAL=yes", "USB_PRODUCT_ID=209c",
-            "MAX_JOB_BYTES=65536", "age(0)=60", "age(1)=60", "age(30)=60", "age(31)=62", "age(60)=120",
+            "MAX_JOB_BYTES=65536", "RAW_COLOR_CHECK=no", "age(0)=60", "age(1)=60", "age(30)=60", "age(31)=62", "age(60)=120",
             "age(61)=60", "age(x)=60"])
         text = (REPO / "selftest.sh").read_text(encoding="utf-8")
         match = re.search(r"(?ms)^runtime_env_checks\(\) \{\n(.*?)^\}", text)
         self.assertIsNotNone(match)
         self.assertIn('"${QLP_RUNTIME_DERIVED[@]}"', match.group(1))
         self.assertIn("qlp_runtime_value", match.group(1))
+
+
+class ColorCheckPostureTest(OpsTestCase):
+    """selftest.sh's T1 section reports RAW_COLOR_CHECK when runtime.env turns it off."""
+
+    SECTION = r'''
+source "$REPO/scripts/lib/common.sh"
+declare -A ST=() RT=()
+PRINT_TEST=0 MONO=0
+section() { :; }
+fact() { :; }
+check() { printf '%s|%s|%s\n' "$1" "$2" "$3"; }
+eval "$(sed -n '/^section_two_color() {/,/^}/p' "$REPO/selftest.sh")"
+ST[available]=1 ST[device_state]=ready ST[status_valid]=1 ST[media_two_color]="$1"
+if [[ "$2" != unset ]]; then RT[RAW_COLOR_CHECK]="$2"; fi
+section_two_color
+'''
+
+    def levels(self, two_color: str, value: str) -> List[str]:
+        done = self.run_bash(self.SECTION, two_color, value)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return [line.split("|")[1] for line in done.stdout.splitlines() if line.endswith("|t1.colorcheck")]
+
+    def test_reported_only_when_off(self):
+        self.assertEqual(self.levels("1", "no"), ["warn"], "a black/red roll is loaded")
+        self.assertEqual(self.levels("0", "no"), ["info"])
+        self.assertEqual(self.levels("1", ""), ["warn"], "an empty value is off, as in the daemon")
+        self.assertEqual(self.levels("1", "yes"), [])
+        self.assertEqual(self.levels("1", "unset"), [], "not in runtime.env: the daemon's default, on")
 
 
 class ConfigTemplateTest(unittest.TestCase):

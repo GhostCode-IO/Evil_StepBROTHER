@@ -9,12 +9,38 @@ Connections are served one at a time; the others wait in the listen backlog,
 which gives clients the same TCP back-pressure as the real printer. Each
 connection goes through these states::
 
-    IDLE ──job bytes──▶ WRITING ──0x1A at a command boundary──▶ SETTLING ──▶ IDLE
-                           │                                    (printer back at
-                           │                                     "receiving")
-                           └── RST/error, RAW_IDLE_TIMEOUT or MAX_JOB_BYTES before
-                               the 0x1A: torn, the printer gets 400 x NUL + ESC @
+    IDLE ──job bytes──▶ CHECKING ──▶ WRITING ──0x1A at a command boundary──▶ SETTLING ──▶ IDLE
+                           │            │                                    (printer back at
+                           │            │                                     "receiving")
+                           │            └── RST/error, RAW_IDLE_TIMEOUT or MAX_JOB_BYTES before
+                           │                the 0x1A: torn, the printer gets 400 x NUL + ESC @
+                           └── colour mode the loaded roll cannot print: refused (RST);
+                               none of the job's print data reaches the printer
 
+* **CHECKING** (``RAW_COLOR_CHECK``, on by default) - a job's print data is
+  held back until it shows its colour mode (its ``ESC i K`` and first raster
+  row, normally within its first kilobyte). A black-only job while a
+  black/red roll is loaded, or a two-colour job while a single-colour roll is
+  loaded, is refused: the printer itself would reject it ("media does not
+  support monochrome printing", or "... two-color printing" per Brother's
+  SDK), and the tested unit, after a black-only job on DK-22251, answered no
+  status request until it was switched off and on. The client gets a reset
+  and the job is recorded as ``refused``. Whenever the job's colour mode or
+  the roll is not certain (no ``ESC i K``, a first raster row that
+  contradicts it, a stream the tokenizer cannot follow before the job shows
+  its mode, no mode within the first 256 KiB held (``_COLOR_HOLD_LIMIT``), no
+  status frame from the last ``STATUS_MAX_AGE_SECONDS`` even after asking for
+  one (none is asked for while the printer's input state is unknown), no
+  roll, an unknown byte 25), the job goes through unchecked.
+* **Before a job** - NULs and the set-up commands (``ESC @``, ``ESC i a 01``,
+  ``ESC i !``) and ``ESC i S`` are no job: a read that holds nothing else is
+  forwarded at once (iPrint&Label for iOS opens a 402-byte connection before
+  each print and for Check Media, presumably 400 NULs and ``ESC @``). A read
+  that ends inside a command keeps that command back until it is complete,
+  and a connection that ends first never sends it, so the printer never
+  waits inside a command because of where a read ended. The same applies
+  after a settled job, to its trailer. With ``RAW_COLOR_CHECK`` on, the read
+  in which a job's print data starts is held whole with the job.
 * **WRITING** - client bytes go to USB unmodified and in order. A
   :class:`~ql810wc.rasterproto.RasterTokenizer` watches them (job end,
   two-color bit, requested media) but never changes them; an opaque stream is
@@ -26,7 +52,8 @@ connection goes through these states::
   some paths a bare ``ESC i S``) once SNMP shows the label done, and a failed
   send fails its print. They are read into a hold buffer, so the client never
   stalls, and forwarded verbatim once the printer is idle again. They are never
-  dropped, never resynchronised on and never make a job torn.
+  resynchronised on and never make a job torn; only an incomplete command the
+  connection ends in is never sent (see **Before a job**).
 * The connection closes only after the client half-closed and the job is
   settled (delivery acknowledgement: everything is with the printer, and the
   result is in ``state.json``), or after ``RAW_IDLE_TIMEOUT`` seconds without
@@ -38,7 +65,11 @@ connection goes through these states::
 * **Torn** means an abnormal end before the job's ``0x1A``: a reset or socket
   error, ``RAW_IDLE_TIMEOUT``, ``MAX_JOB_BYTES``, or the service stopping.
   Parser state alone never makes a job torn. A clean end of stream in the middle
-  of a command is reported as ``error`` and the printer is resynchronised too.
+  of a command, once the job's print data is going to the printer, is reported
+  as ``error`` and the printer is resynchronised too; with no job open, the
+  incomplete command is simply not sent (no error, no resync).
+  A job that ends while it is still held back for the colour check sent no
+  print data to the printer, so there is nothing to resynchronise.
 
 Device lifecycle: the printer is found through sysfs (rescanned every few
 seconds while absent), opened through the kernel usblp node (pyusb as a
@@ -88,6 +119,7 @@ from .rasterproto import (
     RESYNC,
     ST_PRINTING_COMPLETED,
     ST_REPLY,
+    TEXT_COLOR_BLACK_RED,
     RasterTokenizer,
     Status,
 )
@@ -128,6 +160,10 @@ _COMMAND_MODE_RESTORE = 0xFF
 _LOG_REPEAT_SECONDS = 600.0
 #: Longest wait between reopen attempts of a printer that stopped answering.
 _MAX_REOPEN_BACKOFF = 60.0
+#: Most bytes of a job held back for the colour check. A job shows its colour
+#: mode within its first kilobyte or so (a few more with blank lines first);
+#: one that has not after this many bytes goes to the printer unchecked.
+_COLOR_HOLD_LIMIT = 256 * 1024
 _JOURNAL_PRIORITY = {logging.DEBUG: 7, logging.INFO: 6, logging.WARNING: 4,
                      logging.ERROR: 3, logging.CRITICAL: 2}
 
@@ -152,6 +188,8 @@ class ProxySettings:
     status_timeout: float = usbio.STATUS_TIMEOUT
     raw_idle_timeout: float = float(DEFAULT_RAW_IDLE_TIMEOUT)
     max_job_bytes: int = DEFAULT_MAX_JOB_BYTES
+    color_check: bool = True                 # RAW_COLOR_CHECK: refuse jobs the loaded roll cannot print
+    status_max_age: float = 60.0             # STATUS_MAX_AGE_SECONDS: older status is not trusted
     post_job_timeout: float = 60.0           # longest wait for the printer after a job
     post_job_poll: float = 1.0               # ESC i S cadence while settling
     post_job_error_grace: float = 5.0        # a printer error lasting this long ends settling
@@ -178,9 +216,11 @@ class ProxySettings:
                     device: str = "auto", state_path: Optional[str] = None) -> "ProxySettings":
         """Settings from a runtime config (``config.load_runtime_config``).
 
-        Also reads ``RAW_IDLE_TIMEOUT`` (seconds, 10-86400, default 300) and
-        ``MAX_JOB_BYTES`` (64 KiB - 1 GiB, default 16 MiB). ``listen`` overrides
-        ``RAW_BIND``/``RAW_PORT``. Raises ``config.ConfigError``.
+        Also reads ``RAW_IDLE_TIMEOUT`` (seconds, 10-86400, default 300),
+        ``MAX_JOB_BYTES`` (64 KiB - 1 GiB, default 16 MiB), ``RAW_COLOR_CHECK``
+        (default yes) and ``STATUS_MAX_AGE_SECONDS`` (how old a status frame
+        the colour check trusts). ``listen`` overrides ``RAW_BIND``/``RAW_PORT``.
+        Raises ``config.ConfigError``.
         """
         if device != "auto" and not device.startswith("/"):
             raise qconfig.ConfigError(f"device {device!r}: use 'auto' or an absolute path such as /dev/usb/lp0")
@@ -198,6 +238,8 @@ class ProxySettings:
             poll_seconds=float(poll),
             raw_idle_timeout=float(idle),
             max_job_bytes=max_bytes,
+            color_check=qconfig.get_bool(cfg, "RAW_COLOR_CHECK"),
+            status_max_age=float(qconfig.get_int(cfg, "STATUS_MAX_AGE_SECONDS")),
             write_stall_timeout=float(idle),
             heartbeat_seconds=float(min(30, poll)),
             vendor_id=str(cfg.get("USB_VENDOR_ID") or usbio.BROTHER_VID).strip().lower(),
@@ -798,7 +840,7 @@ def describe_requested_media(requested: Mapping[str, int]) -> str:
 
 
 class _Abort(Exception):
-    """Stops serving a connection. ``kind``: client | device | usb | stop | internal."""
+    """Stops serving a connection. ``kind``: client | device | usb | stop | internal | refused."""
 
     def __init__(self, kind: str, detail: str) -> None:
         super().__init__(detail)
@@ -814,6 +856,12 @@ class _Segment:
         self.bytes = 0
         self.job: Optional[JobRecord] = None
         self.after_job = after_job
+        #: The job's bytes held back while the colour check waits for its colour
+        #: mode (None when nothing is held: no job yet, or the check is done or off).
+        self.withheld: Optional[bytearray] = None
+        #: While no job has started: the bytes of a command a read ended in, kept
+        #: back until the command is complete (rasterproto ``partial_command``).
+        self.pending = b""
 
     def observe(self, data: bytes) -> Tuple[int, bool]:
         """Feed ``data`` to the tokenizer, stopping right after the first job end
@@ -836,17 +884,21 @@ class _Segment:
         return total, False
 
     def has_job_content(self) -> bool:
-        """True once the segment holds a job. After a settled job only print
-        data starts a new one; anything else is that job's trailer."""
+        """True once the segment holds a job: print data (any command but NUL
+        padding, the set-up commands and the post-job commands) or a print
+        command. On a fresh connection a stream the tokenizer cannot follow
+        counts too; after a settled job it does not, as P-touch's trailer ends
+        in ``ESC i a FF``, where parsing stops."""
         tok = self.tok
         if self.after_job is None:
-            return tok.in_job or tok.jobs > 0 or tok.opaque is not None or not tok.at_command_boundary
-        return tok.requested_media is not None or tok.raster_lines > 0 or tok.pages > 0
+            return tok.in_job or tok.jobs > 0 or tok.opaque is not None
+        return tok.in_job or tok.jobs > 0
 
     @property
     def at_rest(self) -> bool:
-        """No job here and the stream is at a known command boundary: status
-        requests are safe.
+        """No job here, no set-up command (``ESC @``, ``ESC i a 01``,
+        ``ESC i !``) that a job may follow, and the stream is at a known
+        command boundary: status requests are safe.
 
         That includes a settled job's trailer that ended with ``ESC i a FF``
         (P-touch for Mac), for as long as nothing has followed it: the
@@ -857,7 +909,7 @@ class _Segment:
         anything follows the trailer, it cannot be judged any more, and the
         polls wait until the connection closes."""
         tok = self.tok
-        if self.job is not None or tok.in_job:
+        if self.job is not None or tok.in_job or tok.setup_commands:
             return False
         if tok.opaque is None:
             return tok.at_command_boundary
@@ -986,6 +1038,8 @@ class ProxyDaemon:
         """Serve until stopped; returns the exit code (0)."""
         addresses = ", ".join(format_peer(s.getsockname()) for s in self.listeners)
         log.info("ql810wc-proxyd %s listening on %s", __version__, addresses)
+        if not self.settings.color_check:
+            log.warning("RAW_COLOR_CHECK is off: every job goes to the printer unchecked")
         try:
             # The first device scan comes before the first state.json and READY=1, so
             # neither reports a printer that is attached as absent.
@@ -1252,13 +1306,14 @@ class ProxyDaemon:
             self._next_poll = _mono() + self.settings.poll_seconds
 
     def _refuse(self, sock: socket.socket, peer: str) -> None:
-        """Reject a connection while the printer is unusable: the client sees a
-        reset at once, and state.json records the refused job."""
+        """Turn a connection away while the printer is unusable: the client sees
+        a reset at once, and state.json records the job as an error (nothing
+        reached the printer; ``refused`` is the colour check's result)."""
         reason = f"printer not available: {self._status_text()}"
         _close_socket(sock, abort=True)
         job = JobRecord(peer=peer, started=time.time(), started_mono=_mono())
         self._finish_job(job, "error", reason, stream_unknown=False)    # nothing reached the printer
-        log.warning("refused a print job from %s (%s)", peer, reason)
+        log.warning("turned away a print job from %s (%s)", peer, reason)
 
     def _configure_client(self, sock: socket.socket) -> None:
         sock.setblocking(False)
@@ -1303,16 +1358,43 @@ class ProxyDaemon:
                 if seg.bytes + consumed > self.settings.max_job_bytes:
                     sess.error = f"the job exceeds MAX_JOB_BYTES ({self.settings.max_job_bytes} bytes)"
                     break
+                carried, seg.pending = seg.pending, b""
+                chunk = carried + data[:consumed]
                 if seg.job is None and seg.has_job_content():
-                    seg.job = self._begin_job(sess, seg)
+                    seg.job = self._begin_job(sess, seg, carried=len(carried))
                     jobs.append(seg.job)
-                stall = None
-                if seg.job is None and seg.after_job is not None and seg.after_job.result != "ok":
-                    # The trailer of a failed job: do not hold the connection for minutes
-                    # on a printer that has stopped accepting data.
-                    stall = self.settings.post_job_error_grace
-                self._forward_data(sess, memoryview(data)[:consumed], stall)
-                self._account(seg, consumed)
+                    if self.settings.color_check:
+                        seg.withheld = bytearray()
+                elif seg.job is None:
+                    # No job yet. A read that ends inside a command keeps that command back
+                    # until it is complete: where a read ends never leaves the printer waiting
+                    # inside a command, and a job that starts with it is held whole.
+                    tail = seg.tok.partial_command
+                    if tail and chunk.endswith(tail):
+                        seg.pending = tail
+                        chunk = chunk[:-len(tail)]
+                if seg.withheld is not None:
+                    # The colour check: the job waits here until it shows its colour mode.
+                    seg.withheld += chunk
+                    self._account(seg, consumed)
+                    verdict = self._color_verdict(seg, final=ended or len(seg.withheld) >= _COLOR_HOLD_LIMIT)
+                    if verdict is None:
+                        continue
+                    refuse, detail = verdict
+                    if refuse:
+                        raise _Abort("refused", detail)
+                    release = bytes(seg.withheld)
+                    seg.withheld = None
+                    self._forward_data(sess, memoryview(release))
+                else:
+                    stall = None
+                    if seg.job is None and seg.after_job is not None and seg.after_job.result != "ok":
+                        # The trailer of a failed job: do not hold the connection for minutes
+                        # on a printer that has stopped accepting data.
+                        stall = self.settings.post_job_error_grace
+                    if chunk:
+                        self._forward_data(sess, memoryview(chunk), stall)
+                    self._account(seg, consumed)
                 if ended:
                     job = seg.job
                     assert job is not None      # a 0x1A at a command position is job content
@@ -1346,12 +1428,14 @@ class ProxyDaemon:
             return sess.recv_now(self.settings.recv_size)
         return b""
 
-    def _begin_job(self, sess: _Session, seg: _Segment) -> JobRecord:
+    def _begin_job(self, sess: _Session, seg: _Segment, carried: int = 0) -> JobRecord:
         # The bytes this segment held before the job content: on a fresh connection they
         # belong to the job (its NUL padding); after a settled job they were counted as
-        # that job's trailer already (_account), so the new job starts from zero.
-        held_before = seg.bytes if seg.after_job is None else 0
+        # that job's trailer already (_account), so the new job starts from the
+        # ``carried`` bytes of its first command that were kept back (_Segment.pending).
+        held_before = seg.bytes if seg.after_job is None else carried
         if seg.after_job is not None:
+            seg.after_job.trailer_bytes -= carried
             log.debug("a new job follows on the connection from %s", sess.peer)
         job = JobRecord(peer=sess.peer, started=time.time(), started_mono=_mono(), bytes=held_before)
         self._job = job
@@ -1359,6 +1443,69 @@ class ProxyDaemon:
         self._mark("now")
         self._notify_status()
         return job
+
+    def _color_verdict(self, seg: _Segment, final: bool) -> Optional[Tuple[bool, str]]:
+        """``RAW_COLOR_CHECK``: may the job held in ``seg.withheld`` go to the printer?
+
+        None while the job has not shown its colour mode yet (unless ``final``);
+        else ``(refuse, detail)``. A job is refused only when it clearly asks
+        for a colour mode the loaded roll cannot print, the same check the
+        printer makes: the tokenizer knows the job's mode (its ``ESC i K``, in
+        agreement with its first raster row) and a recent status frame shows a
+        black/red roll (byte 25 ``0x81``) or a single-colour roll (``0x01``).
+        A mode decided before the stream turned opaque still counts, so the
+        verdict does not depend on how the job was split into reads. Anything
+        less certain goes through unchecked."""
+        tok = seg.tok
+        if not tok.color_decided:
+            # An opaque stream never shows its mode; otherwise wait (up to the hold limit).
+            return (False, "") if final or tok.opaque is not None else None
+        wants_two = tok.requested_two_color
+        if wants_two is None:
+            return False, ""
+        roll_two, roll = self._loaded_roll()
+        if roll_two is None or wants_two == roll_two:
+            return False, ""
+        if roll_two:
+            return True, f"a black-only job, but the loaded roll, {roll}, takes two-color jobs only"
+        return True, f"a two-color job, but the loaded roll, {roll}, cannot print red"
+
+    def _loaded_roll(self) -> Tuple[Optional[bool], str]:
+        """The loaded roll as the colour check sees it: (two-colour, description).
+
+        True for a black/red roll (status byte 25 ``0x81``), False for a
+        single-colour roll (``0x01``), from a status frame read in the last
+        ``status_max_age`` seconds. Without one (the idle polls pause while
+        set-up commands wait on a connection) it asks the printer once, unless
+        the printer's input state is unknown (a resync pending): none of the
+        held job has reached it, so a printer in a known state stands between
+        commands. None
+        without such a frame, without a roll (cover open with the roll taken
+        out), or for any other byte-25 value."""
+        link = self.link
+        if not link.ready:
+            return None, ""
+        if self._status_stale() and not link.unknown:
+            try:
+                link.request(resync=False)
+            except UsbError as exc:
+                log.debug("status request for the colour check: %s", exc)
+        frame = link.last_frame
+        if frame is None or not link.ready or not frame.has_media or self._status_stale():
+            return None, ""
+        if frame.text_color == TEXT_COLOR_BLACK_RED:
+            two = True
+        elif frame.text_color == media.TEXT_COLOR_SINGLE:
+            two = False
+        else:
+            return None, ""
+        found = media_summary(frame)
+        return two, str(found["description"]) if found else "an unknown roll"
+
+    def _status_stale(self) -> bool:
+        """No status frame was read in the last ``status_max_age`` seconds."""
+        link = self.link
+        return link.last_frame is None or _mono() - link.last_frame_at > self.settings.status_max_age
 
     def _account(self, seg: _Segment, count: int) -> None:
         seg.bytes += count
@@ -1582,19 +1729,33 @@ class ProxyDaemon:
         if job is None and (sess.idle_timed_out or (abort is not None and abort.kind == "stop")):
             graceful = True                 # nothing pending: an ordinary close
         sess.close(abort=not graceful)
+        dropped = 0
+        if seg.pending and seg.job is None and seg.after_job is not None:
+            # A command kept back after a settled job (_Segment.pending) that the client
+            # never completed: it was not sent, so it is no part of the job's trailer.
+            dropped = len(seg.pending)
+            seg.after_job.trailer_bytes -= dropped
         for record in jobs:
             log.info("%s", record.summary())
         problem = abort.detail if abort is not None else sess.error
         if not jobs:
             if sess.bytes_in:
-                log.info("connection from %s: %d bytes, no print job%s", sess.peer, sess.bytes_in,
-                         f" ({problem})" if problem else "")
+                # What it held (no job: all of it is in this segment), e.g. iPrint&Label's check.
+                tok = seg.tok
+                cut = (f"; the last {len(seg.pending)} bytes, an incomplete command, were not sent"
+                       if seg.pending else "")
+                log.info("connection from %s: %d bytes, no print job (NUL bytes %d, set-up commands %d, "
+                         "status requests %d%s)%s", sess.peer, sess.bytes_in, tok.nul_bytes, tok.setup_commands,
+                         tok.status_requests, cut, f" ({problem})" if problem else "")
             else:
                 log.debug("connection from %s closed without data", sess.peer)
         elif job is None and abort is not None:
             # Ended while forwarding what followed a settled job (a trailer).
             log.log(logging.INFO if abort.kind == "stop" else logging.WARNING,
                     "connection from %s ended after its job: %s", sess.peer, abort.detail)
+        if dropped:
+            log.info("connection from %s: the last %d bytes after its job, an incomplete command, were not sent",
+                     sess.peer, dropped)
         if self._job is not None and self._job.settled:
             self._job = None
         self._notify_status()
@@ -1603,6 +1764,30 @@ class ProxyDaemon:
                            abort: Optional[_Abort]) -> None:
         """The connection ended before this job's 0x1A was forwarded and settled."""
         kind = abort.kind if abort is not None else None
+        if kind == "refused":
+            # The colour check: none of the job's print data reached the printer. The result
+            # is recorded before the client is reset, which is all it learns over raw TCP.
+            assert abort is not None
+            seg.withheld = None
+            log.warning("refused a print job from %s: %s. None of its print data was sent to the printer",
+                        sess.peer, abort.detail)
+            self._finish_job(job, "refused", abort.detail, stream_unknown=False)
+            sess.close(abort=True)
+            return
+        if seg.withheld is not None:
+            # Still held back for the colour check: none of the job's print data reached
+            # the printer, which stands between commands; there is nothing to resynchronise.
+            seg.withheld = None
+            reason = abort.detail if abort is not None else sess.error
+            if reason is not None:
+                self._finish_job(job, "torn", f"{reason}; none of its print data was sent to the printer",
+                                 stream_unknown=False)
+                sess.close(abort=True)
+            else:
+                self._finish_job(job, "error", "the client closed the connection before the end of the job; "
+                                               "none of its print data was sent to the printer",
+                                 stream_unknown=False)
+            return
         if kind in ("device", "usb", "internal"):
             # The write was aborted: where the printer's input stands is unknown.
             sess.close(abort=True)

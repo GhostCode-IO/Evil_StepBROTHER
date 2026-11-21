@@ -81,6 +81,18 @@ entry says whether it is verified).
   printing" and then answered no status requests. `ql810wc-proxyd` reopened
   it, which did not help; a power cycle did, and the daemon found the
   printer ready again by itself.
+- **2026-11-21, Brother's driver for macOS on its own:** a one-page label
+  (black and red text) rendered on a Mac with the queue's PPD, `cupsfilter`
+  to CUPS raster and then the driver's `rastertobrotherQL800` filter; nothing
+  was sent to a printer. With **Color** Monochrome the job had `ESC i K 0a`
+  and `g` rows, with 2-Color(Black/Red) `ESC i K 0b` and `w 01`/`w 02` row
+  pairs. Both start with 400 NULs, `ESC @` and `ESC i a 01`, use `M 02`
+  compression and end with `0x1A`. The filter takes the label size from the
+  job's `media` option: with `media=62mm` the job's `ESC i z` asked for
+  62 mm continuous, without it for the PPD's default, 29 mm × 90 mm
+  die-cut. Replayed against `ql810wc-proxyd` and the test suite's fake
+  printer (DK-22251), the Monochrome job was refused before any of its print
+  data went out, and the 2-Color job was forwarded byte for byte.
 - **2026-11-21, setup.sh:** the one-liner was piped into `sudo bash` on the
   tested unit, which had been installed from a checkout of its own and had
   no git. The clone came from a git bundle of a pre-release commit, since the
@@ -134,8 +146,13 @@ What the design rests on, by topic. Each item names its sources (keys in
 5. **A mono job on DK-22251 leaves the printer in an error that only a power
    cycle clears** [P1]; P-touch itself refuses such a job when it knows the
    roll [B4].
-   → The documentation insists on two-colour mode for DK-22251, and `qlctl
-   test-print` refuses the mismatch. The proxy itself never alters jobs.
+   → `ql810wc-proxyd` refuses such a job, and a two-colour job on a
+   single-colour roll, before its print data reaches the printer
+   (`RAW_COLOR_CHECK`, on by default: the job's `ESC i K` and first raster
+   row against status byte 25 of a recent frame); a job whose colour mode or
+   roll it cannot tell goes through unchecked. The documentation insists on
+   two-colour mode for DK-22251, and `qlctl test-print` refuses the
+   mismatch. The proxy itself never alters jobs.
 
 ### Status block
 
@@ -276,9 +293,20 @@ What the design rests on, by topic. Each item names its sources (keys in
   its own Bonjour TXT values (`pdl`, `usb_CMD`, `priority`).
 - Windows clients: the driver installer's search, the port monitor's SNMP
   status, whether P-touch for Windows shows the roll on a TCP/IP port [P4].
-- How iPrint&Label for iOS finds the box and reads the roll (both work), what
-  its 402-byte TCP 9100 check holds, and which Bonjour service types or SNMP
-  objects the iOS and Android apps use.
+- How iPrint&Label for iOS finds the box and reads the roll (both work), and
+  which Bonjour service types or SNMP objects the iOS and Android apps use.
+- What iPrint&Label's 402-byte TCP 9100 check holds. 400 NULs and `ESC @`
+  fit its size, but it was not captured. `ql810wc-proxyd`'s journal tells:
+  `connection from …: 402 bytes, no print job (NUL bytes …, set-up commands
+  …, status requests …)` if it holds no print data (NULs, set-up commands,
+  status requests, `ESC i U t`), with `; the last N bytes, an incomplete
+  command, were not sent` if it ends inside a command; a `job from …: 402
+  bytes …` line if it holds print data or a command the tokenizer does not
+  know. Print data that shows no colour mode (no `g`/`w` row, `0x0C` or
+  `0x1A`) in a stream the tokenizer can follow is then held back by the
+  colour check (`RAW_COLOR_CHECK`) and never sent (`none of its print data
+  was sent to the printer`); on 2026-11-21, before the check, all 402 bytes
+  were forwarded.
 - Whether the colour-mismatch error code sits in byte 7 or byte 31 on the
   QL-810W(c) (the Mac SDK reads byte 7; a QL-800 used byte 31) [L1, P4].
 

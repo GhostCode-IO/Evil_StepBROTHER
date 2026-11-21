@@ -80,6 +80,18 @@ class VersionAndStatusTest(QlctlTestCase):
         self.assertIn("Job       last: ok, from 192.0.2.10:50000, 1234 bytes, two-color", out)
         self.assertNotIn("STALE", out)
 
+    def test_status_shows_why_the_last_job_failed(self):
+        detail = ("a black-only job, but the loaded roll, 62mm continuous black/red (DK-22251), "
+                  "takes two-color jobs only")
+        self.write_state(state_doc(pid=os.getpid(), job={"last_result": "refused", "peer": "192.0.2.10:50001",
+                                                          "bytes": 10945, "two_color": False,
+                                                          "last_finished": time.time() - 30,
+                                                          "last_detail": detail}))
+        done = self.qlctl("status")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("Job       last: refused, from 192.0.2.10:50001, 10945 bytes, mono", done.stdout)
+        self.assertIn(f"\n          {detail}\n", done.stdout)
+
     def test_status_json(self):
         self.write_state(state_doc())
         done = self.qlctl("status", "--json")
@@ -292,6 +304,20 @@ class EndToEndTest(QlctlTestCase):
                                "--state", h.state_path, "status"], capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("Job       last: ok", done.stdout)
+
+    def test_a_test_label_the_daemon_refuses(self):
+        from tests.test_proxyd import Harness      # the real ql810wc-proxyd with a fake printer
+        h = Harness(self)
+        h.model.set_media("62")                    # a single-colour roll; the label is two-colour
+        h.start()
+        done = subprocess.run([sys.executable, "-I", "-B", str(QLCTL), "--config", self.config,
+                               "--state", h.state_path, "test-print", "--force", "--port", str(h.port)],
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("refused", done.stdout + done.stderr)
+        self.assertIn("a two-color job, but the loaded roll, 62mm continuous", done.stdout + done.stderr)
+        self.assertNotIn("Connection reset", done.stderr)
+        self.assertEqual(h.model.jobs, [])
 
     def test_stale_state_does_not_block_probe(self):
         doc = state_doc(pid=os.getpid())
