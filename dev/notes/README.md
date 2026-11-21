@@ -105,7 +105,8 @@ entry says whether it is verified).
     only. None of its print data was sent to the printer`; the printer kept
     answering status requests, with no error.
   - 2-Color(Black/Red) (17 783 bytes): `two-color, requested 62 mm
-    continuous, result ok` after 6.5 s.
+    continuous, result ok` after 6.5 s. The label came out right, checked by
+    eye: black text, red text and a red line where the PDF had them.
   - `qlctl test-print --mono --force` on the box: refused the same way; qlctl
     printed the reason and exited with 3.
   Not tested yet: printing through a macOS print queue with the check on,

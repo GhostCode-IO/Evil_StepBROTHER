@@ -105,7 +105,7 @@ enforcing, net-snmp 5.9.5.2) with a QL-810Wc on USB.
 |---|---|---|---|
 | P-touch Editor 5.3 for Mac | verified with 5.3.23 (Bonjour) | verified: DK-22251 shown as 62 mm black/red | verified: black and black/red labels, checked by eye |
 | Brother iPrint&Label for iOS | verified (2026-11-21) | verified (2026-11-21), after the app's **Check Media** | verified (2026-11-21) |
-| Other Mac apps (for example PowerPoint) with Brother's QL-810W driver for macOS | verified (2026-11-21): macOS adds the box from Bonjour | not applicable: you choose the label size | partly verified (2026-11-21): the driver's black/red output printed, sent from a Mac straight to TCP 9100; its monochrome output is refused. Not yet through a macOS print queue |
+| Other Mac apps (for example PowerPoint) with Brother's QL-810W driver for macOS | verified (2026-11-21): macOS adds the box from Bonjour | not applicable: you choose the label size | partly verified (2026-11-21): the driver's black/red output, sent from a Mac straight to TCP 9100, printed correctly (checked by eye); its monochrome output is refused. Not yet through a macOS print queue |
 | P-touch Editor for Windows with Brother's QL-810W(c) driver | untested | untested | untested |
 | BRAdmin | untested | untested | not applicable |
 | Android apps (iPrint&Label and others) | untested | untested | untested |
@@ -146,8 +146,9 @@ Also verified on the tested unit:
   from the Mac to TCP 9100. The Monochrome version was refused: the Mac's
   connection was reset, `qlctl status` showed the job as `refused` with the
   reason, and the printer kept answering, with no error and no power cycle.
-  The 2-Color(Black/Red) version printed (result ok). `qlctl test-print
-  --mono --force` was refused the same way and exited with 3.
+  The 2-Color(Black/Red) version printed in black and red where it should
+  (checked by eye). `qlctl test-print --mono --force` was refused the same
+  way and exited with 3.
 - P-touch Editor for Mac sends a short trailer after each job.
   `ql810wc-proxyd` holds it until the printer has finished the label, then
   forwards it; P-touch reports success, and the black and black/red labels
