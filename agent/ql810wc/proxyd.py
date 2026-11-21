@@ -1310,10 +1310,10 @@ class ProxyDaemon:
         a reset at once, and state.json records the job as an error (nothing
         reached the printer; ``refused`` is the colour check's result)."""
         reason = f"printer not available: {self._status_text()}"
+        log.warning("turned away a print job from %s (%s)", peer, reason)
         _close_socket(sock, abort=True)
         job = JobRecord(peer=peer, started=time.time(), started_mono=_mono())
         self._finish_job(job, "error", reason, stream_unknown=False)    # nothing reached the printer
-        log.warning("turned away a print job from %s (%s)", peer, reason)
 
     def _configure_client(self, sock: socket.socket) -> None:
         sock.setblocking(False)
@@ -1728,7 +1728,6 @@ class ProxyDaemon:
         graceful = abort is None and sess.error is None
         if job is None and (sess.idle_timed_out or (abort is not None and abort.kind == "stop")):
             graceful = True                 # nothing pending: an ordinary close
-        sess.close(abort=not graceful)
         dropped = 0
         if seg.pending and seg.job is None and seg.after_job is not None:
             # A command kept back after a settled job (_Segment.pending) that the client
@@ -1756,6 +1755,7 @@ class ProxyDaemon:
         if dropped:
             log.info("connection from %s: the last %d bytes after its job, an incomplete command, were not sent",
                      sess.peer, dropped)
+        sess.close(abort=not graceful)      # after the journal lines: they are written when the client sees the close
         if self._job is not None and self._job.settled:
             self._job = None
         self._notify_status()

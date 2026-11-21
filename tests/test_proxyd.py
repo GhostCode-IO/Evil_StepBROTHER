@@ -85,16 +85,28 @@ def _how_closed(sock: socket.socket, timeout: float = 15.0) -> str:
     return "fin"
 
 
-def _send_refusable(h: "Harness", data: bytes) -> str:
-    """Send a job like CUPS does; "rst" if the proxy reset the connection
-    (while it was being sent or after), "fin" for an ordinary close."""
-    sock = h.connect()
+def _send_and_close(sock: socket.socket, data: bytes) -> str:
+    """Send ``data`` and half-close, like CUPS does; then "rst" if the proxy
+    reset the connection (while it was being sent or after), "fin" for an
+    ordinary close. A send that fails counts as the reset: once a send has
+    reported it, Linux returns end of file to the next read."""
     try:
         sock.sendall(data)
         sock.shutdown(socket.SHUT_WR)
     except OSError:
         return "rst"
     return _how_closed(sock)
+
+
+def _send_refusable(h: "Harness", data: bytes) -> str:
+    """A job on a new connection; see _send_and_close."""
+    return _send_and_close(h.connect(), data)
+
+
+def _wait_logged(h: "Harness", logs: Any, text: str) -> None:
+    """Inside assertLogs: wait until a captured line contains ``text`` (the
+    daemon logs from its own thread)."""
+    h.wait_for(lambda: any(text in line for line in logs.output), f"a log line with {text!r}")
 
 
 def _recv_until_closed(sock: socket.socket, timeout: float = 15.0) -> bytes:
@@ -854,17 +866,13 @@ class ColorCheckTest(unittest.TestCase):
             with self.subTest(pieces=pieces):
                 h = Harness(self).start()
                 sock = h.connect()
-                try:
-                    if pieces == 1:
-                        sock.sendall(job)
-                    else:
-                        sock.sendall(job[:cut])
-                        time.sleep(0.2)
-                        sock.sendall(job[cut:])
-                    sock.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
-                self.assertEqual(_how_closed(sock), "rst")
+                if pieces == 1:
+                    how = _send_and_close(sock, job)
+                else:
+                    sock.sendall(job[:cut])
+                    time.sleep(0.2)                    # the refusal comes with this first read
+                    how = _send_and_close(sock, job[cut:])
+                self.assertEqual(how, "rst")
                 self.assertEqual(h.state()["job"]["last_result"], "refused")
                 self.assertNotIn(PRINT_INFO, h.session_bytes())
                 self.assertFalse(h.model.mute)
@@ -880,12 +888,7 @@ class ColorCheckTest(unittest.TestCase):
         start = len(h.session_bytes())
         time.sleep(1.5)
         self.assertEqual(h.session_bytes()[start:], b"", "no polls while a job may follow")
-        try:
-            sock.sendall(MONO[len(setup):])
-            sock.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
-        self.assertEqual(_how_closed(sock), "rst")
+        self.assertEqual(_send_and_close(sock, MONO[len(setup):]), "rst")
         self.assertEqual(h.state()["job"]["last_result"], "refused")
         rest = h.session_bytes()[start:]
         self.assertTrue(rest.startswith(STATUS_REQUEST), "one status request before the decision")
@@ -909,12 +912,7 @@ class ColorCheckTest(unittest.TestCase):
                 time.sleep(0.2)
                 self.assertFalse(h.session_bytes().endswith(second[:cut]), "the cut ESC i z is kept back")
                 start = len(h.session_bytes())
-                try:
-                    sock.sendall(second[cut:])
-                    sock.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
-                self.assertEqual(_how_closed(sock), "rst" if refused else "fin")
+                self.assertEqual(_send_and_close(sock, second[cut:]), "rst" if refused else "fin")
                 state = h.state()["job"]
                 rest = h.session_bytes()[start:]
                 if refused:
@@ -936,12 +934,7 @@ class ColorCheckTest(unittest.TestCase):
         sock.sendall(JOB)
         h.wait_state(lambda s: s["job"]["last_result"] == "ok" and not s["job"]["active"], "the first job printed")
         start = len(h.session_bytes())
-        try:
-            sock.sendall(second)
-            sock.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
-        self.assertEqual(_how_closed(sock), "rst")
+        self.assertEqual(_send_and_close(sock, second), "rst")
         self.assertEqual(h.state()["job"]["last_result"], "refused")
         rest = h.session_bytes()[start:]
         self.assertNotIn(job_id, rest, "held from its first print data, not from ESC i z")
@@ -981,6 +974,7 @@ class SetupConnectionTest(unittest.TestCase):
                     sock.sendall(check)
                     sock.shutdown(socket.SHUT_WR)
                     self.assertEqual(_how_closed(sock), "fin", "an ordinary close")
+                    _wait_logged(h, logs, f"{len(check)} bytes, no print job")
                 self.assertEqual(h.state()["job"], before, "the last job stays the last job")
                 self.assertTrue(any(f"{len(check)} bytes, no print job {contents}" in line for line in logs.output),
                                 logs.output)
@@ -1017,6 +1011,7 @@ class SetupConnectionTest(unittest.TestCase):
         start = len(h.session_bytes())
         with self.assertLogs("ql810wc.proxyd", "INFO") as logs:
             self.assertEqual(h.send_job(INVALIDATE + b"\x1b\x69"), b"")
+            _wait_logged(h, logs, "no print job")
         self.assertTrue(any("402 bytes, no print job" in line
                             and "the last 2 bytes, an incomplete command, were not sent" in line
                             for line in logs.output), logs.output)
@@ -1035,6 +1030,7 @@ class SetupConnectionTest(unittest.TestCase):
             sock.sendall(PTOUCH_TRAILER[:5])               # ESC i U t, one byte short
             sock.shutdown(socket.SHUT_WR)
             self.assertEqual(_how_closed(sock), "fin")
+            _wait_logged(h, logs, "after its job, an incomplete command, were not sent")
         self.assertNotIn(PTOUCH_TRAILER[:5], h.session_bytes()[start:])
         self.assertTrue(any("the last 5 bytes after its job, an incomplete command, were not sent" in line
                             for line in logs.output), logs.output)
@@ -1154,15 +1150,16 @@ class StatusTest(unittest.TestCase):
         self.assertIn("Editor Lite", state["device"]["detail"])
         self.assertEqual(state["device"]["pid"], "209c", "identity stays the printer's")
         written = h.printer.total_written
-        sock = h.connect()
-        try:
-            sock.sendall(JOB_B)
-            sock.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
         with self.assertLogs("ql810wc.proxyd", "WARNING") as logs:
+            sock = h.connect()
+            try:
+                sock.sendall(JOB_B)
+                sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
             self.assertEqual(_recv_until_closed(sock), b"")
             h.wait_state(lambda s: s["job"]["last_result"] == "error", "job turned away")
+            _wait_logged(h, logs, "turned away a print job from 127.0.0.1:")
         self.assertTrue(any("turned away a print job from 127.0.0.1:" in line and "printer not available" in line
                             for line in logs.output), logs.output)
         self.assertEqual(h.printer.total_written, written, "nothing reaches the printer")
