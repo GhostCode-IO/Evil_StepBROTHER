@@ -1,0 +1,10 @@
+# /etc/udev/rules.d/60-ql810wc-proxy.rules — installed by ql810wc-print-proxy
+# (scripts/20-cups-queue.sh); removed by uninstall.sh. Do not edit here: the
+# vendor id comes from USB_VENDOR_ID in config.env.
+#
+# Group "lp" may read and write the Brother printer's USB device node, so the
+# proxy daemon (user ql810wc, supplementary group lp) can use its libusb
+# fallback whenever the kernel usblp driver (/dev/usb/lp*, already root:lp
+# 0660 on Fedora) is not bound. Also applies in Editor Lite (USB drive) mode,
+# where it is harmless.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="@USB_VENDOR_ID@", MODE="0660", GROUP="lp"

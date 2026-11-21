@@ -1,0 +1,45 @@
+# ql810wc-print-proxy: keep site-specific values and secrets out of git.
+# Git history is public and permanent. Only templates, placeholders and
+# DERIVED assets (agent/oid-map.yaml) are ever committed.
+
+# --- Site-specific config & secrets ---------------------------------------
+config.env
+*.env
+!config.sample.env
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+.secrets/
+
+# --- Raw SNMP walks and dev/walks/ output (contain serials, MACs, IPs) ------
+*.walk
+*.snmpwalk
+*.snmprec
+dev/walks/*
+!dev/walks/README.md
+
+# --- Python -----------------------------------------------------------------
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# --- Editors / OS / local scratch ---------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+*.log
+logs/
+tmp/

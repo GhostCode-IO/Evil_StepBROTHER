@@ -1,0 +1,456 @@
+#!/usr/bin/python3 -IB
+"""qlctl: operator CLI for ql810wc-print-proxy.
+
+    qlctl status [--json [--show-serial]]       what ql810wc-proxyd last saw (state.json)
+    qlctl test-print [--two-color|--mono]       print a test label through the proxy (TCP)
+                     [--host H --port P] [--pattern bars|black] [--width MM] [--rows N] [--force]
+    qlctl probe [--device auto|/dev/usb/lpN]    read the status straight from USB
+                [--json [--show-serial]]        (refused while ql810wc-proxyd runs)
+                [--resync] [--force]
+    qlctl version
+
+JSON output masks the printer's USB serial (its first three characters
+remain, as in the logs) unless --show-serial is given.
+
+Exit codes: 0 success; 1 failure (state missing, printer unreachable, job
+not delivered); 2 usage error; 3 refused or not ready (status: printer not
+ready or reporting an error; test-print: loaded roll does not match the
+job; probe: ql810wc-proxyd owns the printer).
+
+Installed next to the ql810wc package in /usr/local/libexec/ql810wc-proxy.
+Isolated mode (-I) keeps this script's directory off sys.path, so it is
+added here explicitly.
+"""
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.realpath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import argparse  # noqa: E402
+import ipaddress  # noqa: E402
+import json  # noqa: E402
+import math  # noqa: E402
+import shutil  # noqa: E402
+import socket  # noqa: E402
+import subprocess  # noqa: E402
+import time  # noqa: E402
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple  # noqa: E402
+
+from ql810wc import __version__, config, media, rasterproto, statecache, usbio  # noqa: E402
+from ql810wc.proxyd import format_peer, mask_serial  # noqa: E402
+from ql810wc.statecache import age_seconds, get_path  # noqa: E402
+
+UNIT = "ql810wc-proxyd.service"
+EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_REFUSED = 0, 1, 2, 3
+#: state.json older than this does not count as a running ql810wc-proxyd.
+STATE_FRESH_SECONDS = 120.0
+
+
+def _err(message: str) -> None:
+    print(f"qlctl: {message}", file=sys.stderr)
+
+
+def _load_config(path: str) -> config.RuntimeConfig:
+    """The runtime config; built-in defaults (with a note) when unreadable."""
+    try:
+        return config.load_runtime_config(path)
+    except config.ConfigError as exc:
+        if os.path.exists(path):
+            _err(f"ignoring {path}: {exc}")
+        return config.load_runtime_config(None)
+
+
+def _state_path(args: argparse.Namespace, cfg: Mapping[str, str]) -> str:
+    return args.state or str(cfg.get("STATE_FILE") or "") or statecache.DEFAULT_PATH
+
+
+def _serial(serial: Any, show: bool) -> Any:
+    """A USB serial for JSON output: masked like the logs unless ``show``."""
+    if show or not isinstance(serial, str) or not serial:
+        return serial
+    return mask_serial(serial)
+
+
+def _ago(seconds: Optional[float]) -> str:
+    """``3s`` / ``2m05s`` / ``1h02m`` / ``3d04h`` (``?`` when unknown)."""
+    if seconds is None:
+        return "?"
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    if s < 86400:
+        return f"{s // 3600}h{s % 3600 // 60:02d}m"
+    return f"{s // 86400}d{s % 86400 // 3600:02d}h"
+
+
+def _media_info(frame: Optional[rasterproto.Status]) -> Optional[Dict[str, Any]]:
+    if frame is None or not frame.has_media:
+        return None
+    found = media.describe(frame)
+    if found is None:
+        return {"label_id": None, "name": None, "two_color": frame.two_color,
+                "description": f"unsupported roll (width {frame.media_width_mm} mm, "
+                               f"type 0x{frame.media_type_raw:02x}, length {frame.media_length_mm} mm)",
+                "dk_parts": []}
+    return {"label_id": found.label_id, "name": found.name, "two_color": found.needs_two_color,
+            "description": found.description, "dk_parts": list(media.dk_parts_for(frame))}
+
+
+def summarize(doc: Mapping[str, Any], max_age: float) -> Dict[str, Any]:
+    """The facts an operator (or selftest.sh) needs from a state document."""
+    frame = statecache.status_from_state(doc)
+    status_age = age_seconds(doc, "status.polled")
+    job_active = bool(get_path(doc, "job.active"))
+    stale = frame is None or ((status_age is None or status_age > max_age) and not job_active)
+    errors = frame.errors() if frame is not None else []
+    device_state = get_path(doc, "device.state")
+    return {
+        "ok": device_state == "ready" and not errors and not stale,
+        "device_state": device_state,
+        "device_detail": get_path(doc, "device.detail"),
+        "status_age_seconds": status_age,
+        "stale": stale,
+        "media": _media_info(frame),
+        "errors": errors,
+        "job_active": job_active,
+        "last_result": get_path(doc, "job.last_result"),
+    }
+
+
+def _print_status(doc: Mapping[str, Any], summary: Mapping[str, Any], path: str) -> None:
+    proxy = doc.get("proxy") or {}
+    pid = proxy.get("pid")
+    started = proxy.get("started")
+    uptime = time.time() - started if isinstance(started, (int, float)) else None
+    run = f"pid {pid}, up {_ago(uptime)}" if pid else "not running (last state kept)"
+    print(f"ql810wc-proxyd {proxy.get('version', '?')}  {run}, TCP port {proxy.get('raw_port', '?')}"
+          f"  (state {path}, updated {_ago(age_seconds(doc))} ago)")
+    device = doc.get("device") or {}
+    name = " ".join(str(device[k]) for k in ("manufacturer", "product") if device.get(k)) or "printer"
+    where = f"{device.get('vid') or '?'}:{device.get('pid') or '?'}"
+    if device.get("transport"):
+        where += f" via {device['transport']} {device.get('node') or ''}".rstrip()
+    line = f"Printer   {summary['device_state']}: {name} ({where})"
+    if summary["device_state"] != "ready" and summary.get("device_detail"):
+        line += f"\n          {summary['device_detail']}"
+    print(line)
+    frame = statecache.status_from_state(doc)
+    if frame is None:
+        print("Status    unknown (no status read yet)")
+    else:
+        kind = rasterproto.STATUS_TYPES.get(frame.status_type, f"type 0x{frame.status_type:02x}")
+        phase = rasterproto.PHASE_TYPES.get(frame.phase_type, f"phase 0x{frame.phase_type:02x}")
+        stale = "  [STALE]" if summary["stale"] else ""
+        print(f"Status    {kind}, phase {phase}, read {_ago(summary['status_age_seconds'])} ago{stale}")
+    info = summary["media"]
+    if info is None:
+        print("Media     " + ("none loaded" if frame is not None else "unknown"))
+    else:
+        print(f"Media     {info['description']}" + ("  [two-color]" if info["two_color"] else ""))
+    print("Errors    " + (", ".join(summary["errors"]) if summary["errors"] else "none"))
+    job = doc.get("job") or {}
+    if job.get("active"):
+        print(f"Job       printing: from {job.get('peer')}, {job.get('bytes', 0)} bytes so far")
+    elif job.get("last_result"):
+        two = {True: "two-color", False: "mono"}.get(job.get("two_color"), "colour unknown")
+        print(f"Job       last: {job['last_result']}, from {job.get('peer')}, {job.get('bytes', 0)} bytes, "
+              f"{two}, {_ago(age_seconds(doc, 'job.last_finished'))} ago")
+    else:
+        print("Job       none yet")
+
+
+def cmd_status(args: argparse.Namespace, cfg: config.RuntimeConfig) -> int:
+    path = _state_path(args, cfg)
+    doc = statecache.StateCache(path).read()
+    if doc is None:
+        if args.json:
+            print(json.dumps({"state_file": path, "available": False}, indent=2, sort_keys=True))
+        _err(f"no readable state at {path}: is ql810wc-proxyd running?")
+        return EXIT_FAIL
+    summary = summarize(doc, float(cfg.get_int("STATUS_MAX_AGE_SECONDS")))
+    if args.json:
+        device = doc.get("device")
+        if isinstance(device, dict) and "serial" in device:
+            device["serial"] = _serial(device["serial"], args.show_serial)
+        print(json.dumps({"state_file": path, "available": True, "age_seconds": age_seconds(doc),
+                          "summary": summary, "state": doc}, indent=2, sort_keys=True))
+    else:
+        _print_status(doc, summary, path)
+    return EXIT_OK if summary["ok"] else EXIT_REFUSED
+
+
+def _default_host(cfg: Mapping[str, str]) -> str:
+    bind = str(cfg.get("RAW_BIND") or "").strip()
+    if bind:
+        try:
+            if not ipaddress.ip_address(bind).is_unspecified:
+                return bind
+        except ValueError:
+            pass
+    return "127.0.0.1"
+
+
+def _check_roll(frame: Optional[rasterproto.Status], two_color: bool,
+                width: Optional[int] = None) -> Optional[str]:
+    """Why the loaded roll cannot take this test job, or None. ``width``: the
+    tape width asked for with --width (None: the job follows the roll)."""
+    if frame is None:
+        return None
+    if not frame.has_media:
+        return "no roll is loaded"
+    found = media.describe(frame, exact=False)
+    if found is None or not found.is_continuous:
+        return ("a die-cut or unsupported roll is loaded; the test label needs continuous tape "
+                f"({found.description if found else 'unknown roll'})")
+    if two_color and not frame.two_color:
+        return (f"the loaded roll ({found.description}) is not black/red: the printer rejects "
+                "a two-color job. Use --mono")
+    if not two_color and frame.two_color:
+        return ("a black/red roll (DK-22251) is loaded: a mono job puts the printer in an error that "
+                "only a power cycle clears. Use --two-color --pattern black for a black-only test")
+    if width is not None and width != frame.media_width_mm:
+        # The job's ESC i z says which width it needs (its "width valid" flag is set).
+        return (f"the loaded roll is {frame.media_width_mm} mm wide but --width {width} was requested: "
+                "the printer rejects the job ('replace media') until the roll cover is opened and closed")
+    return None
+
+
+def _send_job(host: str, port: int, job: bytes, timeout: float) -> Tuple[float, str]:
+    """Send a job, half-close, wait for the proxy to close (delivery).
+    Returns (seconds until the close, our address as the proxy reports its
+    peer); raises OSError / socket.timeout."""
+    started = time.monotonic()
+    with socket.create_connection((host, port), timeout=min(10.0, timeout)) as sock:
+        local = format_peer(sock.getsockname())
+        sock.settimeout(timeout)
+        sock.sendall(job)
+        sock.shutdown(socket.SHUT_WR)
+        deadline = started + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout("the proxy did not close the connection")
+            sock.settimeout(remaining)
+            if not sock.recv(4096):            # back-channel bytes, if any, are ignored
+                return time.monotonic() - started, local
+
+
+def cmd_test_print(args: argparse.Namespace, cfg: config.RuntimeConfig) -> int:
+    two_color = not args.mono
+    path = _state_path(args, cfg)
+    doc = statecache.StateCache(path).read()
+    frame = statecache.status_from_state(doc)
+    if frame is None:
+        _err(f"printer status unknown (no state at {path}); sending without checking the roll")
+    width = args.width
+    if width is None:
+        found = media.describe(frame, exact=False) if frame is not None and frame.has_media else None
+        width = found.width_mm if found is not None and found.is_continuous and not two_color else 62
+        if width not in rasterproto.CONTINUOUS_PINS:
+            width = 62
+    try:
+        job = rasterproto.make_test_job(width, two_color, args.pattern, args.rows)
+    except ValueError as exc:
+        _err(str(exc))
+        return EXIT_USAGE
+    problem = _check_roll(frame, two_color, width=args.width)
+    if problem:
+        if not args.force:
+            _err(f"refusing: {problem} (or --force)")
+            return EXIT_REFUSED
+        _err(f"warning: {problem}; sending anyway (--force)")
+    host = args.host or _default_host(cfg)
+    port = args.port or cfg.get_int("RAW_PORT")
+    kind = "two-color" if two_color else "mono"
+    rows = args.rows or rasterproto.DEFAULT_TEST_LINES
+    started = time.time()
+    try:
+        elapsed, local = _send_job(host, port, job, args.timeout)
+    except socket.timeout:
+        _err(f"sent {len(job)} bytes to {host}:{port}, but the proxy did not confirm delivery "
+             f"within {args.timeout:.0f} s")
+        return EXIT_FAIL
+    except OSError as exc:
+        _err(f"cannot send the test label to {host}:{port}: {exc}")
+        return EXIT_FAIL
+    print(f"sent {len(job)} bytes ({kind}, {args.pattern}, {width} mm, {rows} rows) to {host}:{port}; "
+          f"delivered after {elapsed:.1f} s")
+    # ql810wc-proxyd publishes the job's result before it closes the connection.
+    after = statecache.StateCache(path).read()
+    finished = get_path(after, "job.last_finished")
+    if (get_path(after, "job.peer") == local and isinstance(finished, (int, float))
+            and finished >= started - 1):
+        result = get_path(after, "job.last_result")
+        detail = get_path(after, "job.last_detail")
+        print(f"printer result: {result}" + (f" ({detail})" if detail else ""))
+        if result != "ok":
+            return EXIT_FAIL
+    else:
+        print(f"printer result: not in {path} (is it ql810wc-proxyd's state file?)")
+    return EXIT_OK
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def proxyd_running(state: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """Why the printer belongs to ql810wc-proxyd right now, or None."""
+    systemctl = shutil.which("systemctl")
+    if systemctl:
+        try:
+            done = subprocess.run([systemctl, "is-active", "--quiet", UNIT], timeout=5,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            if done.returncode == 0:
+                return f"{UNIT} is active"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    pid = get_path(state, "proxy.pid")
+    fresh = (age_seconds(state) or math.inf) <= STATE_FRESH_SECONDS
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and fresh and _pid_alive(pid):
+        return f"ql810wc-proxyd (pid {pid}) is running"
+    return None
+
+
+def cmd_probe(args: argparse.Namespace, cfg: config.RuntimeConfig) -> int:
+    path = _state_path(args, cfg)
+    owner = proxyd_running(statecache.StateCache(path).read())
+    if owner and not args.force:
+        _err(f"refusing: {owner} and owns the printer; use 'qlctl status' (or --force)")
+        return EXIT_REFUSED
+    if args.device == "auto":
+        info = usbio.find_printer(str(cfg.get("USB_VENDOR_ID") or usbio.BROTHER_VID),
+                                  str(cfg.get("USB_PRODUCT_ID") or "") or None,
+                                  str(cfg.get("USB_SERIAL") or "") or None)
+        if info is None:
+            info = usbio.find_editor_lite(str(cfg.get("USB_VENDOR_ID") or usbio.BROTHER_VID))
+        if info is None:
+            _err("no Brother QL printer found on USB")
+            return EXIT_FAIL
+    else:
+        if not os.path.exists(args.device):
+            _err(f"{args.device}: no such device")
+            return EXIT_FAIL
+        info = usbio.info_for_node(args.device)
+    if info.mode == usbio.MODE_MASS_STORAGE:
+        _err(f"{info.describe()}: {usbio.EDITOR_LITE_HINT}")
+        return EXIT_FAIL
+    try:
+        transport = usbio.open_transport(info)
+    except usbio.UsbError as exc:
+        _err(f"cannot open the printer: {exc}")
+        return EXIT_FAIL
+    with transport:
+        try:
+            frame = usbio.request_status(transport, resync=args.resync, timeout=args.timeout)
+        except usbio.StatusTimeout as exc:
+            _err(f"{exc}" + ("" if args.resync else " (try --resync)"))
+            return EXIT_FAIL
+        except usbio.UsbError as exc:
+            _err(f"USB error: {exc}")
+            return EXIT_FAIL
+        device_id = usbio.read_ieee1284_id(info, transport)
+    found = _media_info(frame)
+    if args.json:
+        print(json.dumps({
+            "device": {"vid": info.vid, "pid": info.pid, "product": info.product,
+                       "manufacturer": info.manufacturer, "serial": _serial(info.serial, args.show_serial),
+                       "node": transport.node, "transport": transport.kind,
+                       "ieee1284_id": device_id},
+            "status": frame.to_dict(), "media": found}, indent=2, sort_keys=True))
+        return EXIT_OK
+    print(f"Printer   {info.describe()} via {transport.kind}")
+    if device_id:
+        print(f"1284 ID   {device_id}")
+    print(f"Status    {frame.raw.hex(' ')}")
+    kind = rasterproto.STATUS_TYPES.get(frame.status_type, f"type 0x{frame.status_type:02x}")
+    phase = rasterproto.PHASE_TYPES.get(frame.phase_type, f"phase 0x{frame.phase_type:02x}")
+    print(f"          {kind}, phase {phase}, model {frame.model_name or 'unknown'}")
+    if found is None:
+        print("Media     none loaded")
+    else:
+        print(f"Media     {found['description']}" + ("  [two-color]" if found["two_color"] else ""))
+    errors = frame.errors()
+    print("Errors    " + (", ".join(errors) if errors else "none"))
+    return EXIT_OK
+
+
+def cmd_version(_args: argparse.Namespace, _cfg: config.RuntimeConfig) -> int:
+    print(f"qlctl (ql810wc-print-proxy) {__version__}")
+    return EXIT_OK
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The command-line interface."""
+    parser = argparse.ArgumentParser(prog="qlctl", description="Operate the ql810wc-print-proxy.")
+    parser.add_argument("--config", default=config.RUNTIME_ENV,
+                        help="runtime settings (default: %(default)s; defaults when missing)")
+    parser.add_argument("--state", default=None, help="state file (default: STATE_FILE from the config)")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    sub.required = True
+
+    status = sub.add_parser("status", help="show what ql810wc-proxyd last saw")
+    status.add_argument("--json", action="store_true", help="machine-readable output")
+    status.add_argument("--show-serial", action="store_true",
+                        help="print the printer's USB serial in full (JSON output masks it)")
+    status.set_defaults(func=cmd_status)
+
+    test = sub.add_parser("test-print", help="print a test label through the proxy's TCP port")
+    colour = test.add_mutually_exclusive_group()
+    colour.add_argument("--two-color", dest="mono", action="store_false",
+                        help="black/red job for DK-22251 (default)")
+    colour.add_argument("--mono", dest="mono", action="store_true", help="black-only job for mono rolls")
+    test.add_argument("--pattern", choices=rasterproto.TEST_PATTERNS, default="bars",
+                      help="bars: black, red and split bands; black: black only (default: %(default)s)")
+    test.add_argument("--width", type=int, default=None,
+                      help="tape width in mm (default: the loaded roll, 62 for two-color)")
+    test.add_argument("--rows", type=int, default=None,
+                      help=f"label length in 300 dpi rows (default {rasterproto.DEFAULT_TEST_LINES})")
+    test.add_argument("--host", default=None, help="proxy address (default: 127.0.0.1, or RAW_BIND)")
+    test.add_argument("--port", type=int, default=None, help="proxy port (default: RAW_PORT)")
+    test.add_argument("--timeout", type=float, default=120.0,
+                      help="seconds to wait for delivery (default: %(default)s)")
+    test.add_argument("--force", action="store_true", help="send even if the loaded roll does not match")
+    test.set_defaults(func=cmd_test_print, mono=False)
+
+    probe = sub.add_parser("probe", help="read the printer status straight from USB")
+    probe.add_argument("--device", default="auto", help="'auto' or a /dev/usb/lpN node")
+    probe.add_argument("--json", action="store_true", help="machine-readable output")
+    probe.add_argument("--show-serial", action="store_true",
+                       help="print the printer's USB serial in full (JSON output masks it)")
+    probe.add_argument("--resync", action="store_true",
+                       help="send 400 x NUL + ESC @ first (cancels anything the printer is doing)")
+    probe.add_argument("--timeout", type=float, default=3.0, help="seconds to wait (default: %(default)s)")
+    probe.add_argument("--force", action="store_true", help="even while ql810wc-proxyd is running")
+    probe.set_defaults(func=cmd_probe)
+
+    version = sub.add_parser("version", help="print the version")
+    version.set_defaults(func=cmd_version)
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Run qlctl; returns the exit code."""
+    args = build_parser().parse_args(argv)
+    cfg = _load_config(args.config)
+    try:
+        return int(args.func(args, cfg))
+    except config.ConfigError as exc:
+        _err(f"configuration error: {exc}")
+        return EXIT_USAGE
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

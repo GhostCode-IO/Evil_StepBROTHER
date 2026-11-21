@@ -1,0 +1,72 @@
+# ql810wc-proxyd.service — template rendered by scripts/20-cups-queue.sh
+# (qlp_render_unit), installed into /etc/systemd/system and removed by
+# uninstall.sh. Do not edit the copy there.
+#
+# The data plane (docs/architecture.md section 4): the only process that
+# touches the USB printer. It forwards raw jobs from ql810wc-proxyd.socket,
+# polls the printer's status while idle and writes /run/ql810wc-proxy/state.json
+# for the SNMP agent. Enabled at boot (not only on the first connection) so
+# the status is fresh before anyone prints.
+#
+# Rendered for RAW_BIND="@RAW_BIND@" RAW_PORT="@RAW_PORT@"; the listening socket
+# itself is ql810wc-proxyd.socket (the daemon binds nothing when socket-activated).
+[Unit]
+Description=ql810wc-print-proxy data plane (raw TCP to USB Brother QL-810W/QL-810Wc)
+Documentation=man:systemd.service(5)
+Requires=ql810wc-proxyd.socket
+After=ql810wc-proxyd.socket
+# Keep retrying forever: the daemon itself survives a missing printer, so a
+# restart loop means a crash that must not leave the print server dead.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+# /usr/local/libexec is usr_t under SELinux: run the script through python3.
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/ql810wc-proxy/ql810wc-proxyd --config /etc/ql810wc-proxy/runtime.env --state /run/ql810wc-proxy/state.json
+Environment=LC_ALL=C.UTF-8
+User=ql810wc
+Group=ql810wc
+SupplementaryGroups=lp
+RuntimeDirectory=ql810wc-proxy
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+UMask=0022
+Restart=always
+RestartSec=2
+# Exit status 64 (EX_USAGE: bad command line) and 78 (EX_CONFIG: invalid
+# runtime.env): restarting cannot help.
+RestartPreventExitStatus=64 78
+WatchdogSec=60
+TimeoutStopSec=30
+SyslogIdentifier=ql810wc-proxyd
+
+# Hardening. The daemon needs /dev/usb/lp* (usblp) or /dev/bus/usb (libusb
+# fallback) and read access to /sys, so there is no PrivateDevices=, no
+# DevicePolicy= and nothing that implies one (ProtectClock= adds a DeviceAllow=
+# on some systemd versions). Without capabilities it cannot set the clock anyway.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/run/ql810wc-proxy
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+# AF_NETLINK: libusb watches hotplug events (pyusb fallback).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+Also=ql810wc-proxyd.socket

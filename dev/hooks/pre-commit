@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Enable once per clone:  git config core.hooksPath dev/hooks
+exec "$(git rev-parse --show-toplevel)/dev/hooks/check-hygiene.sh" --staged

@@ -1,0 +1,30 @@
+# ql810wc-proxyd.socket — template rendered by scripts/20-cups-queue.sh
+# (qlp_render_unit: @RAW_PORT@ <- RAW_PORT; with RAW_BIND set, the listen
+# line becomes ADDRESS:PORT plus FreeBind=yes). Installed into
+# /etc/systemd/system and removed by uninstall.sh. Do not edit the copy there.
+#
+# The raw print port, like a networked QL's: systemd holds the listening
+# socket and hands it to ql810wc-proxyd (Accept=no), which serves one
+# connection at a time. Other clients wait in the backlog meanwhile (TCP
+# back-pressure, as on the real printer).
+[Unit]
+Description=ql810wc-print-proxy raw print port (TCP @RAW_PORT@)
+Documentation=man:systemd.socket(5)
+
+[Socket]
+ListenStream=@RAW_PORT@
+Accept=no
+# Dual-stack on the wildcard address: clients may resolve the box to IPv6.
+BindIPv6Only=both
+Backlog=32
+NoDelay=yes
+# Short keepalive timers: a client that vanished mid-job (powered off, lost its
+# network) is noticed within about a minute and its job is torn, so the next
+# job is not stuck behind it. ql810wc-proxyd sets the same on each connection.
+KeepAlive=yes
+KeepAliveTimeSec=30
+KeepAliveIntervalSec=10
+KeepAliveProbes=3
+
+[Install]
+WantedBy=sockets.target

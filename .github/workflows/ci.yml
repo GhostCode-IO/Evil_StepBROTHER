@@ -1,0 +1,125 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    name: secret hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Scan every tracked file (no raw walks, real config, keys, binary files, private IPs, MACs)
+        run: dev/hooks/check-hygiene.sh --all
+
+  lint-test:
+    name: lint + tests (Fedora 44)
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      # gawk, sed, grep, diffutils, hostname: what the shell tests
+      # (tests/test_shell_scripts.py) run besides bash and coreutils; the
+      # minimal container image does not promise any of them. perl: the
+      # timeout wrapper of dev/snmpwalk/walk.sh, which
+      # tests/test_dev_snmpwalk.py runs against stub SNMP tools (skipped
+      # without it).
+      - name: Install tools
+        run: >
+          dnf -y install --setopt=install_weak_deps=False
+          git findutils shellcheck python3 python3-pyyaml net-snmp net-snmp-utils
+          gawk sed grep diffutils hostname perl-interpreter
+      - uses: actions/checkout@v7
+      - name: shellcheck
+        run: find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -r shellcheck -x
+      - name: Python unit + integration tests
+        run: |
+          if [ -d tests ]; then python3 -m unittest discover -s tests -t . -v; else echo "no tests yet"; fi
+
+  # The one-line install on a Fedora 44 that has never seen this project, as
+  # far as a container allows: root, but no systemd, SELinux or printer. The
+  # bootstrap runs from stdin like "curl ... | sudo bash" and clones this
+  # commit from a local repository on a branch made for the run.
+  fresh-fedora:
+    name: setup.sh on a fresh Fedora 44 (container)
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:44
+    timeout-minutes: 30
+    env:
+      QLP_REPO_URL: /srv/ql810wc-print-proxy.git
+      QLP_SRC_DIR: /usr/local/src/ql810wc-print-proxy
+      QLP_REPO_REF: ci-setup
+    steps:
+      # git only for the checkout and the local repository made from it; it is
+      # removed again before setup.sh runs.
+      - name: Install git for the checkout (removed again below)
+        run: dnf -y install --setopt=install_weak_deps=False git-core
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Every Fedora Server has gawk, grep, sed, systemd-udev (udevadm) and
+      # util-linux-core (flock); the container image may not, and setup.sh
+      # (flock: one run at a time) and the installer's step 10 use them.
+      # git, python3 and iproute stay out on purpose: setup.sh installs them.
+      - name: Add what every Fedora Server has
+        run: >
+          dnf -y install --setopt=install_weak_deps=False
+          /usr/bin/awk /usr/bin/grep /usr/bin/sed /usr/bin/udevadm /usr/bin/flock
+      - name: Serve this commit from a local git repository, then remove git again
+        run: |
+          rm -rf /srv/snapshot "$QLP_REPO_URL"
+          mkdir -p /srv/snapshot
+          cp -R . /srv/snapshot/
+          rm -rf /srv/snapshot/.git
+          git -C /srv/snapshot init -q -b "$QLP_REPO_REF"
+          git -C /srv/snapshot add -A
+          git -C /srv/snapshot -c user.name=ci -c user.email=ci@example.invalid commit -q -m "CI snapshot"
+          git clone -q --bare /srv/snapshot "$QLP_REPO_URL"
+          rm -rf /srv/snapshot
+          dnf -y remove git-core
+          hash -r
+          if command -v git; then echo "git is still installed" >&2; exit 1; fi
+          for tool in python3 ip; do
+            if command -v "$tool" >/dev/null; then echo "note: the image has $tool already"; fi
+          done
+      - name: Bootstrap from stdin (setup.sh installs git-core itself)
+        run: |
+          cd /
+          cat "$GITHUB_WORKSPACE/setup.sh" | bash -s -- --config-only
+      - name: Check config.env and what setup.sh installed
+        run: |
+          cfg="$QLP_SRC_DIR/config.env"
+          test "$(stat -c '%a %U %G' "$cfg")" = "600 root root"
+          grep -E '^SNMP_PRINTER_ALLOWED_CIDRS="[^"]+"$' "$cfg"
+          grep -qx 'SNMP_V3_ENABLE="no"' "$cfg"
+          for tool in git python3 ip; do command -v "$tool"; done
+          grep -qxF "$(printf 'pkg\tgit-core')" /var/lib/ql810wc-proxy/manifest
+      - name: A second run fast-forwards the checkout and keeps config.env
+        run: |
+          cfg="$QLP_SRC_DIR/config.env"
+          before="$(sha256sum "$cfg")"
+          rm -rf /srv/work
+          git clone -q "$QLP_REPO_URL" /srv/work
+          echo "second commit" > /srv/work/ci-second-commit.txt
+          git -C /srv/work add ci-second-commit.txt
+          git -C /srv/work -c user.name=ci -c user.email=ci@example.invalid commit -q -m "CI second commit"
+          git -C /srv/work push -q origin "HEAD:$QLP_REPO_REF"
+          cd /
+          cat "$GITHUB_WORKSPACE/setup.sh" | bash -s -- --config-only
+          test -f "$QLP_SRC_DIR/ci-second-commit.txt"
+          test "$(sha256sum "$cfg")" = "$before"
+      # Step 10 needs neither systemd nor SELinux: it installs the packages
+      # (dnf) and the brother_ql_next venv (PyPI).
+      - name: Package and venv step on the pristine system (install.sh --only 10)
+        working-directory: /usr/local/src/ql810wc-print-proxy
+        run: ./install.sh --only 10
+      - name: Check the packages, the venv and the recorded config.env
+        run: |
+          for c in lpadmin lpstat snmpd snmpget avahi-daemon avahi-browse semanage lsusb udevadm; do command -v "$c"; done
+          grep -qxF "$QLP_SRC_DIR/config.env" /var/lib/ql810wc-proxy/config-path
+          python3 -I -c 'import yaml, usb.core'
+          /opt/ql810wc-proxy/venv/bin/python -I -c 'import importlib.metadata as m; print("brother_ql_next", m.version("brother_ql_next"))'

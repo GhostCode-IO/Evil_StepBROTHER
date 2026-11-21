@@ -1,0 +1,80 @@
+# /etc/systemd/system/ql810wc-snmp-agent.service
+# Installed by ql810wc-print-proxy (scripts/30-snmp-agent.sh, SNMP_AGENT_MODE=agentx);
+# removed by uninstall.sh. Do not edit: change config.env and re-run ./install.sh.
+#
+# The SNMP printer persona: an AgentX subagent of snmpd that registers the
+# Brother QL-810W persona in SNMP context "printer" (docs/architecture.md
+# section 6). It reads ql810wc-proxyd's state.json and never touches USB. It
+# reports READY=1 once snmpd has accepted every registration, reconnects by
+# itself whenever snmpd restarts, and closes its session on stop.
+#
+# Prefer "systemctl reload" to a restart. Reload (SIGHUP) re-reads runtime.env,
+# identity.env and oid-map.yaml and serves them in the same AgentX session. A
+# restart closes the session, and until the new process has registered, snmpd
+# answers the persona's OIDs with noSuchName, which fails a P-touch print at once.
+# New code or a new unit file still needs a restart.
+[Unit]
+Description=ql810wc-print-proxy SNMP printer persona (AgentX subagent)
+Documentation=man:snmpd.conf(5)
+After=network-online.target snmpd.service ql810wc-proxyd.service
+Wants=snmpd.service
+# Keep restarting after crashes, however often: a dead persona fails every print.
+StartLimitIntervalSec=0
+
+[Service]
+# notify-reload: "systemctl reload" sends SIGHUP and returns only once the agent
+# has answered RELOADING=1 (with MONOTONIC_USEC=) and then READY=1, so the
+# installer sees the outcome. A reload that fails (an invalid file) is logged,
+# keeps the running persona and puts "last reload failed: ..." into the status.
+Type=notify-reload
+User=ql810wc
+Group=ql810wc
+# /usr/local/libexec is usr_t under SELinux: run the script through the
+# interpreter, never directly. -I ignores PYTHON* variables and user site
+# packages, -B writes no bytecode next to the code.
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/ql810wc-proxy/brother_snmp_agent.py --mode agentx --socket /var/agentx/master --context printer --config /etc/ql810wc-proxy/runtime.env --identity /etc/ql810wc-proxy/identity.env --state /run/ql810wc-proxy/state.json --oid-map /usr/local/libexec/ql810wc-proxy/oid-map.yaml
+Environment=LC_ALL=C.UTF-8
+SyslogIdentifier=ql810wc-snmp-agent
+Restart=always
+# After a crash, snmpd answers noSuchName until the new process has
+# registered, so come back quickly.
+RestartSec=1
+# 64 = bad command line, 78 = bad runtime.env or oid-map.yaml: restarting cannot fix either.
+RestartPreventExitStatus=64 78
+# snmpd normally accepts the registrations within a second. If it does not,
+# the start fails visibly instead of hanging.
+TimeoutStartSec=60
+TimeoutStopSec=10
+UMask=0077
+
+# --- Hardening: the agent only reads files and talks to two unix sockets
+# (/var/agentx/master, the systemd notify socket). It needs no devices, no IP
+# networking, no capabilities and no writable paths.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+MemoryMax=128M
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target

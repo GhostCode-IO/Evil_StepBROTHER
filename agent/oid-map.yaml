@@ -1,0 +1,543 @@
+# agent/oid-map.yaml - the printer persona that ql810wc-snmp-agent serves.
+#
+# This is the shipped, firmware-tagged asset of docs/architecture.md section 7.
+# It lists every OID the box answers *as the printer*, where each value comes
+# from, and how sure we are of it. The printer is a Brother QL-810W; the
+# QL-810Wc reports the same model everywhere. The file holds derived knowledge
+# only: raw walks never enter git.
+#
+# agent/ql810wc/persona.py loads it with PyYAML; without PyYAML it reads an
+# oid-map.json next to this file instead. The loader rejects anything that
+# breaks the rules below, so a mistake stops the service with a clear message
+# instead of confusing a client.
+#
+# Schema (schema_version 1)
+# -------------------------
+#   schema_version: 1
+#   model: QL-810W            persona model: MDL of the IEEE-1284 ID, status bytes
+#                             3/4 of the "turned off" block, ${MODEL} in templates
+#                             (QL-800 | QL-810W | QL-820NWB)
+#   validated_firmware: []    firmware strings this map was confirmed against on a
+#                             real QL-810W(c) on Wi-Fi (dev/snmpwalk/README.md);
+#                             empty = not yet
+#   entries:                  one item per OID instance (any order; served sorted)
+#     - oid: "1.3.6.1..."     numeric, quoted, without a leading dot
+#       name: brStatusBlock   unique label for logs and docs
+#       type: octets          see "Types"
+#       source: {...}         see "Sources"
+#       context: printer      SNMP context. Schema 1 knows only "printer"
+#       verified: true        see "verified"
+#       clients: [...]        who reads it, see "Clients" (optional)
+#       notes: "..."          evidence and where the value comes from (required)
+#
+# Types
+#   integer    INTEGER (32-bit signed)
+#   octets     OCTET STRING, binary. pass_persist answers it as hex bytes
+#   string     OCTET STRING holding text (DisplayString, cut to 255 bytes)
+#   oid        OBJECT IDENTIFIER (constant: quoted dotted string)
+#   timeticks  TimeTicks (hundredths of a second)
+#   counter32  Counter32
+#   gauge32    Gauge32
+#   ipaddress  IpAddress (constant: dotted quad)
+#   P-touch Editor for Mac rejects every type but integer, octets and string.
+#
+# Sources (exactly one kind per entry)
+#   {const: VALUE}            a constant. octets: hex text such as "80 20 42"
+#   {config: KEY}             a runtime setting (agent/ql810wc/config.py SETTINGS),
+#                             e.g. PERSONA_LOCATION
+#   {template: "TEXT"}        text with ${KEY} (runtime setting) or ${MODEL};
+#                             write $$ for a literal $
+#   {provider: NAME}          a value computed by the agent, optionally with
+#   {provider: NAME, default: VALUE}   the value used when the provider has none.
+#                             Without a default the OID is absent then.
+#
+# Providers (persona.py PROVIDERS; each accepts only the types shown)
+#   status_block              octets   the 32-byte Brother status block: the live
+#                                      USB frame verbatim. While a job is in flight
+#                                      (no frame read since it started) only bytes
+#                                      18-21 change, to 00 01 00 00 (reply, phase
+#                                      printing), for at most 60 s after the job's
+#                                      last byte. A "turned off" error block when
+#                                      the printer or the proxy is unavailable.
+#                                      Never absent.
+#   ieee1284_id               string   the printer's USB IEEE-1284 device ID with MDL
+#                                      forced to "MDL:<model>" (no space, no "c")
+#   serial                    string   PERSONA_SERIAL, else the printer's USB serial
+#   mac                       octets   6-byte MAC: PERSONA_MAC, else the interface
+#                                      holding PROXY_IP, else the default route's
+#   sysname                   string   PERSONA_SYSNAME, else "BRW" + the MAC as 12 hex
+#   sysuptime                 timeticks  hundredths of a second since the agent started
+#   hr_device_status          integer  2 running, 5 down (error or offline), 1 unknown
+#   hr_printer_status         integer  3 idle, 4 printing, 5 warmup, 1 other
+#   hr_detected_error_state   octets   1 octet of RFC 3805 bits: 0x40 noPaper,
+#                                      0x08 doorOpen, 0x04 jammed, 0x02 offline,
+#                                      0x01 serviceRequested
+#   cover_status              integer  3 open, 4 closed, 2 unknown
+#   input_status              integer  0 media loaded, 19 no media, 37 offline,
+#                                      69 warming up
+#   media_name                string   e.g. 62mm / 2.4" (empty without media)
+#   media_width               integer  roll width in 1/100 mm, -2 when unknown
+#   media_length              integer  label length in 1/100 mm, -1 continuous,
+#                                      -2 unknown
+#   console_text              string   16 characters: READY, BUSY, COVER OPEN, ERROR,
+#                                      OFFLINE
+#
+# Where each entry is served
+#   SNMP_AGENT_MODE=agentx (default): every entry, in SNMP context "printer". The
+#     subagent registers 1.3.6.1.4.1.2435 (it holds the status block) first, then
+#     1.3.6.1.2.1.1, .2, .25 and .43, each only while the map has an entry in it.
+#     v1/v2c communities see only that context (scripts/30-snmp-agent.sh).
+#     "systemctl reload ql810wc-snmp-agent" applies an edited map without closing
+#     the AgentX session; a map the loader rejects is logged and the old one stays.
+#   SNMP_AGENT_MODE=pass_persist (degraded): only the entries under
+#     1.3.6.1.2.1.43 and 1.3.6.1.4.1.2435, in the default context. The system,
+#     interfaces and host-resources entries would collide with the host's own MIBs.
+#
+# verified
+#   true   this OID, its SNMP type and the meaning of its value were seen on a
+#          real QL-810W/QL-810Wc: in walks or status frames that others have
+#          published, or on the tested unit (dev/notes/usb-ground-truth.md).
+#          Site-specific values (serial, MAC, location) naturally differ.
+#   false  inferred from other Brother models, a client binary, a standard or
+#          reasoning. Confirm or correct it by reading a real QL-810W(c) on
+#          Wi-Fi (dev/snmpwalk/README.md).
+#
+# Clients (persona.py CLIENTS)
+#   ptouch-mac      P-touch Editor 5.3 for Mac (MacPrintSDK, static analysis): SNMPv1,
+#                   community "internal", one varbind per GET, 2 s per try, retries up
+#                   to 60 s (10 s for the 1284 ID). It accepts only INTEGER and OCTET
+#                   STRING replies, and fails at once on noSuchName. The loader
+#                   enforces those types on every entry that lists it.
+#   win-ptouch      Brother Windows driver / P-touch Editor for Windows
+#   win-installer   Brother driver installer network search: one SNMPv1 broadcast GET
+#                   of 5 varbinds; one missing OID fails the whole PDU
+#   mobile-sdk      Brother Print SDK / iPrint&Label discovery: one GET of 6 varbinds
+#   bradmin         BRAdmin Light / Professional
+#   cups            CUPS socket backend (polls status around each job) and snmp backend
+#   tcpmon          Windows Standard TCP/IP port monitor with SNMP status enabled
+#   nms             generic network monitoring (LibreNMS, Observium, Checkmk, ...)
+#   third-party     open-source label tools: labelito, BrotherRaster, partdb,
+#                   thermal-label, ql-unidrv
+#
+# Deliberately NOT served: SNMP communities (Brother MFCs leak their SET community at
+# 2435.2.4.3.1240.1.15/.17); printer settings (WLAN, TCP/IP, power, templates);
+# the Silex 1240 tree and the PWG/HP mirrors (outside the persona view);
+# counters the proxy does not keep (prtMarkerLifeCount, brInfoCounter); and
+# values nobody has read from a QL-810W(c) yet (prtGeneralPrinterName, firmware
+# versions).
+schema_version: 1
+model: QL-810W
+validated_firmware: []
+entries:
+  # ------------------------------------------------------------------------
+  # MIB-II system group (agentx only: these collide with the host's own values)
+  # ------------------------------------------------------------------------
+  - oid: "1.3.6.1.2.1.1.1.0"
+    name: sysDescr
+    type: string
+    source: {const: "Brother NC-36002w, Firmware Ver.1.00"}
+    context: printer
+    verified: false
+    clients: [win-installer, nms]
+    notes: >-
+      The print server (NC) description, not the printer model. A live QL-810W
+      (fw 1.22) answered "Brother NC-36002w, Firmware Ver.1.00" (labelito; possibly
+      truncated: other Brother NCs append "  (yy.mm.dd),MID ...,FID 2").
+      In the Windows installer's broadcast bundle. The full QL-810Wc string is
+      still to be read from a printer on Wi-Fi.
+  - oid: "1.3.6.1.2.1.1.2.0"
+    name: sysObjectID
+    type: oid
+    source: {const: "1.3.6.1.4.1.2435.2.3.9.1"}
+    context: printer
+    verified: false
+    clients: [nms]
+    notes: >-
+      BROTHER-MIB net-printer. Seen on Brother lasers and MFCs (live walks) and used
+      by NMS profiles to classify Brother devices. Not yet seen on a QL.
+  - oid: "1.3.6.1.2.1.1.3.0"
+    name: sysUpTime
+    type: timeticks
+    source: {provider: sysuptime}
+    context: printer
+    verified: false
+    clients: [nms]
+    notes: >-
+      Standard MIB-II object, present on every Brother NC. Agent uptime stands in
+      for the printer's.
+  - oid: "1.3.6.1.2.1.1.4.0"
+    name: sysContact
+    type: string
+    source: {config: PERSONA_CONTACT}
+    context: printer
+    verified: false
+    clients: [nms]
+    notes: >-
+      Standard MIB-II object (user-set on Brother NCs). Empty unless PERSONA_CONTACT
+      is set. It is readable in cleartext, so prefer a role over a person's name.
+  - oid: "1.3.6.1.2.1.1.5.0"
+    name: sysName
+    type: string
+    source: {provider: sysname}
+    context: printer
+    verified: true
+    clients: [win-installer, mobile-sdk, bradmin]
+    notes: >-
+      Brother node name: "BRW" (wireless NC) + 12 hex digits of the MAC, as on a live
+      QL-810W (labelito). In the Windows installer (5-varbind) and mobile SDK
+      (6-varbind) discovery bundles. Uses this box's MAC (or PERSONA_MAC /
+      PERSONA_SYSNAME).
+  - oid: "1.3.6.1.2.1.1.6.0"
+    name: sysLocation
+    type: string
+    source: {config: PERSONA_LOCATION}
+    context: printer
+    verified: true
+    clients: [mobile-sdk, cups, bradmin]
+    notes: >-
+      Brother "printer name/location" (Brother Command Reference FAQ, listed for the
+      QL-810W). Also the Bonjour TXT note=. In the mobile SDK bundle, so it must exist
+      even when empty. Avoid personal data.
+  - oid: "1.3.6.1.2.1.1.7.0"
+    name: sysServices
+    type: integer
+    source: {const: 72}
+    context: printer
+    verified: false
+    clients: [nms]
+    notes: >-
+      72 (application + end-to-end layers), the value a Brother MFC NC returned in a
+      live walk. Not yet seen on a QL.
+
+  # ------------------------------------------------------------------------
+  # Interfaces: one row, ifIndex 1 = the printer's NIC (agentx only)
+  # ------------------------------------------------------------------------
+  - oid: "1.3.6.1.2.1.2.1.0"
+    name: ifNumber
+    type: integer
+    source: {const: 1}
+    context: printer
+    verified: false
+    clients: [nms]
+    notes: >-
+      One interface, so that a walk of the persona's interfaces group is
+      consistent. A real QL-810W (Wi-Fi only) has one radio NIC; nobody has read
+      its exact count yet.
+  - oid: "1.3.6.1.2.1.2.2.1.1.1"
+    name: ifIndex.1
+    type: integer
+    source: {const: 1}
+    context: printer
+    verified: false
+    clients: [nms]
+    notes: >-
+      Brother NCs number their primary NIC 1 (live MFC walk). Brother clients read
+      ifPhysAddress.1.
+  - oid: "1.3.6.1.2.1.2.2.1.2.1"
+    name: ifDescr.1
+    type: string
+    source: {const: "NC-36002w"}
+    context: printer
+    verified: false
+    clients: [nms]
+    notes: >-
+      Brother NCs describe interface 1 by their NC model (MFC: "NC-8500h"). This
+      uses the QL-810W's NC model from sysDescr. Not yet read from a QL.
+  - oid: "1.3.6.1.2.1.2.2.1.3.1"
+    name: ifType.1
+    type: integer
+    source: {const: 6}
+    context: printer
+    verified: false
+    clients: [nms]
+    notes: >-
+      ethernetCsmacd(6). The MFC reported 7 for every NIC, wireless included; the
+      QL-810W's value is not known yet.
+  - oid: "1.3.6.1.2.1.2.2.1.6.1"
+    name: ifPhysAddress.1
+    type: octets
+    source: {provider: mac, default: ""}
+    context: printer
+    verified: false
+    clients: [win-installer, mobile-sdk]
+    notes: >-
+      The printer's MAC as 6 raw bytes (MFC live walk; Brother mobile bundle). In the
+      Windows installer and mobile SDK discovery bundles, so it is never absent:
+      empty when no MAC can be found (set PERSONA_MAC then). Linux would answer its
+      loopback (no MAC) here, which is why the persona has its own context.
+  - oid: "1.3.6.1.2.1.2.2.1.7.1"
+    name: ifAdminStatus.1
+    type: integer
+    source: {const: 1}
+    context: printer
+    verified: false
+    clients: [nms]
+    notes: "up(1): a printer that answers SNMP has its interface up."
+  - oid: "1.3.6.1.2.1.2.2.1.8.1"
+    name: ifOperStatus.1
+    type: integer
+    source: {const: 1}
+    context: printer
+    verified: false
+    clients: [nms]
+    notes: "up(1): a printer that answers SNMP has its interface up."
+
+  # ------------------------------------------------------------------------
+  # HOST-RESOURCES-MIB: device 1 = the printer (agentx only)
+  # ------------------------------------------------------------------------
+  - oid: "1.3.6.1.2.1.25.3.2.1.1.1"
+    name: hrDeviceIndex.1
+    type: integer
+    source: {const: 1}
+    context: printer
+    verified: false
+    clients: [cups, nms]
+    notes: "Brother printers expose the printer as hrDevice 1 (live MFC walk)."
+  - oid: "1.3.6.1.2.1.25.3.2.1.2.1"
+    name: hrDeviceType.1
+    type: oid
+    source: {const: "1.3.6.1.2.1.25.3.1.5"}
+    context: printer
+    verified: false
+    clients: [cups]
+    notes: >-
+      hrDevicePrinter. The CUPS snmp backend's discovery broadcast asks exactly this
+      and expects this value (CUPS backend/snmp.c); live MFC walk agrees.
+  - oid: "1.3.6.1.2.1.25.3.2.1.3.1"
+    name: hrDeviceDescr.1
+    type: string
+    source: {template: "Brother ${MODEL}"}
+    context: printer
+    verified: true
+    clients: [mobile-sdk, cups, third-party]
+    notes: >-
+      "Brother QL-810W" on a live QL-810W (labelito, partdb); the Brother FAQ calls it
+      the model. In the mobile SDK bundle; the CUPS backends show it. Kept equal to
+      the Bonjour "ty" key.
+  - oid: "1.3.6.1.2.1.25.3.2.1.4.1"
+    name: hrDeviceID.1
+    type: oid
+    source: {const: "0.0"}
+    context: printer
+    verified: false
+    clients: [nms]
+    notes: "0.0 = no product id, as the live MFC walk shows."
+  - oid: "1.3.6.1.2.1.25.3.2.1.5.1"
+    name: hrDeviceStatus.1
+    type: integer
+    source: {provider: hr_device_status}
+    context: printer
+    verified: true
+    clients: [tcpmon, nms, third-party]
+    notes: >-
+      Real QL-810W state matrix (BrotherRaster fixtures, fw 1.22): running(2) when
+      ready, printing or idle without media; down(5) for cover open, no media after
+      a job, or the media-mismatch latch. down(5) also when the printer is offline;
+      unknown(1) when ql810wc-proxyd is not running.
+  - oid: "1.3.6.1.2.1.25.3.5.1.1.1"
+    name: hrPrinterStatus.1
+    type: integer
+    source: {provider: hr_printer_status}
+    context: printer
+    verified: true
+    clients: [ptouch-mac, cups, tcpmon, third-party]
+    notes: >-
+      idle(3), printing(4) (labelito), other(1) for errors and offline, warmup(5)
+      until the first status after the printer appears. P-touch for Mac reads it as
+      INTEGER and requires 3 before template transfers; the CUPS socket backend polls
+      it around every job.
+  - oid: "1.3.6.1.2.1.25.3.5.1.2.1"
+    name: hrPrinterDetectedErrorState.1
+    type: octets
+    source: {provider: hr_detected_error_state}
+    context: printer
+    verified: true
+    clients: [cups, tcpmon, third-party]
+    notes: >-
+      One octet on a real QL-810W: 00 ready, 08 cover open, 40 no media after a job,
+      00 in the media-mismatch latch (BrotherRaster). The other status error bits map
+      to jammed / offline / serviceRequested (RFC 3805 bit order: bit 0 = 0x80).
+
+  # ------------------------------------------------------------------------
+  # Printer-MIB (RFC 3805): served in both modes
+  # ------------------------------------------------------------------------
+  - oid: "1.3.6.1.2.1.43.5.1.1.17.1"
+    name: prtGeneralSerialNumber.1
+    type: string
+    source: {provider: serial, default: ""}
+    context: printer
+    verified: false
+    clients: [third-party]
+    notes: >-
+      The Brother FAQ lists it for the serial number, and a live QL-810W returned a
+      9-character serial (labelito). Here it is the USB serial number (or
+      PERSONA_SERIAL); whether that equals the printer's own value is not confirmed.
+  - oid: "1.3.6.1.2.1.43.6.1.1.3.1.1"
+    name: prtCoverStatus.1.1
+    type: integer
+    source: {provider: cover_status}
+    context: printer
+    verified: true
+    clients: [third-party]
+    notes: >-
+      coverClosed(4) / coverOpen(3) on a real QL-810W (BrotherRaster), from status
+      err2 bit 0x10. unknown(2) while the printer is offline.
+  - oid: "1.3.6.1.2.1.43.8.2.1.3.1.1"
+    name: prtInputDimUnit.1.1
+    type: integer
+    source: {const: 4}
+    context: printer
+    verified: false
+    clients: [third-party]
+    notes: >-
+      micrometers(4) although the dimensions below are in 1/100 mm: a firmware quirk
+      seen on a QL-820NWBc (thermal-label). The QL-810W's value is not known yet.
+  - oid: "1.3.6.1.2.1.43.8.2.1.4.1.1"
+    name: prtInputMediaDimFeedDirDeclared.1.1
+    type: integer
+    source: {provider: media_length}
+    context: printer
+    verified: true
+    clients: [third-party]
+    notes: >-
+      Label length: -1 for continuous rolls on a live QL-810W (labelito); die-cut
+      length x 100 (QL-820NWBc 29x90: 9000). -2 (unknown) without media or offline.
+  - oid: "1.3.6.1.2.1.43.8.2.1.5.1.1"
+    name: prtInputMediaDimXFeedDirDeclared.1.1
+    type: integer
+    source: {provider: media_width}
+    context: printer
+    verified: true
+    clients: [third-party]
+    notes: >-
+      Roll width x 100: 6200 for 62 mm on a live QL-810W (labelito). -2 (unknown)
+      without media or offline.
+  - oid: "1.3.6.1.2.1.43.8.2.1.11.1.1"
+    name: prtInputStatus.1.1
+    type: integer
+    source: {provider: input_status}
+    context: printer
+    verified: true
+    clients: [third-party]
+    notes: >-
+      0 with media, 19 (critical alert + unavailable) without, on a real QL-810W
+      (BrotherRaster): the only standard object that shows an empty printer while
+      idle. 37 (unknown + off-line) when the printer is offline (our choice).
+  - oid: "1.3.6.1.2.1.43.8.2.1.12.1.1"
+    name: prtInputMediaName.1.1
+    type: string
+    source: {provider: media_name}
+    context: printer
+    verified: true
+    clients: [third-party]
+    notes: >-
+      Seen as '62mm / 2.4"' (DK-22205 and DK-22251 alike), '29mm / 1.1"' and
+      '29mm x 90mm / 1.1" x 3.5"' on real QL-810W/820NWB printers. Other names follow
+      the same pattern (agent/ql810wc/media.py). It cannot tell black/red rolls apart:
+      only the status block can.
+  - oid: "1.3.6.1.2.1.43.16.5.1.2.1.1"
+    name: prtConsoleDisplayBufferText.1.1
+    type: string
+    source: {provider: console_text}
+    context: printer
+    verified: true
+    clients: [ptouch-mac, third-party]
+    notes: >-
+      16 characters, space-padded: READY, COVER OPEN, ERROR (no media after a job, the
+      media-mismatch latch) and BUSY (just after a job) on a real QL-810W
+      (BrotherRaster, labelito). BUSY while printing and OFFLINE are our choices.
+      P-touch for Mac declares it, but reads it through a string call that macOS
+      does not implement.
+
+  # ------------------------------------------------------------------------
+  # Brother private MIB (enterprise 2435): served in both modes
+  # ------------------------------------------------------------------------
+  - oid: "1.3.6.1.4.1.2435.2.3.9.1.1.7.0"
+    name: brieee1284id
+    type: string
+    source: {provider: ieee1284_id, default: "MFG:Brother;CMD:PT-CBP;MDL:QL-810W;CLS:PRINTER;"}
+    context: printer
+    verified: false
+    clients: [ptouch-mac, win-installer, mobile-sdk]
+    notes: >-
+      IEEE-1284 device ID (BROTHER-MIB). P-touch for Mac's "Connect to printer with an
+      IP address" makes one GET of it and requires the field "MDL:QL-810W" exactly.
+      A live QL-810W's value contains MDL:QL-810W (labelito); nobody has read its
+      full network form yet. This is the tested unit's USB ID (CMD:PT-CBP,URF ...;
+      dev/notes/usb-ground-truth.md) with MDL normalised. The default is the
+      ptouch-driver form for when no printer was seen yet. It is in the
+      installer and mobile bundles.
+  - oid: "1.3.6.1.4.1.2435.2.3.9.4.2.1.5.5.1.0"
+    name: brInfoSerialNumber
+    type: string
+    source: {provider: serial, default: ""}
+    context: printer
+    verified: false
+    clients: [ptouch-mac, mobile-sdk]
+    notes: >-
+      BROTHER-MIB printer serial (12 zero-padded characters on lasers). In the mobile
+      SDK discovery bundle, so it is never absent. P-touch for Mac declares it, but
+      reads it through a string call that macOS does not implement. The QL format
+      and its relation to the USB serial are not confirmed.
+  - oid: "1.3.6.1.4.1.2435.2.4.3.1240.1.1.0"
+    name: brpsNodeName
+    type: string
+    source: {provider: sysname}
+    context: printer
+    verified: false
+    clients: [bradmin]
+    notes: >-
+      Print-server node name, equal to sysName on Brother NCs (laser and MFC walks);
+      BRAdmin lists printers by it.
+  - oid: "1.3.6.1.4.1.2435.2.4.3.1240.1.3.0"
+    name: brpsHardwareType
+    type: integer
+    source: {const: 0}
+    context: printer
+    verified: false
+    clients: [win-installer]
+    notes: >-
+      NC hardware type. It is one of the 5 varbinds of the Windows installer's
+      broadcast GET (observed with an MFC-era installer). One missing OID fails that
+      whole SNMPv1 PDU, so it is served. 0 is what an NC-8500h MFC and an HL-L2315D
+      NC return; an NC-6200h returned 2198. The QL-810W's value is not known yet.
+  - oid: "1.3.6.1.4.1.2435.2.4.3.2435.5.39.1.0"
+    name: brPhoenixSupport
+    type: integer
+    source: {const: 0}
+    context: printer
+    verified: false
+    clients: [mobile-sdk]
+    notes: >-
+      "Phoenix" support flag (meaning unknown): 0 on an HL-L2315D walk and the answer
+      of a third-party bridge that works with the Brother mobile app and P-touch for
+      Mac (okms/brother-ql700-raw-bridge).
+  - oid: "1.3.6.1.4.1.2435.3.3.9.1.6.1.0"
+    name: brStatusBlock
+    type: octets
+    source: {provider: status_block}
+    context: printer
+    verified: true
+    clients: [ptouch-mac, win-ptouch, mobile-sdk, third-party]
+    notes: >-
+      The 32-byte status block, byte for byte the reply to ESC i S over USB. Brother
+      documents the OID for the QL-810W (Command Reference FAQ). A live QL-810W
+      (fw 1.22) serves it over SNMPv1, and the tested QL-810Wc's USB frame for
+      DK-22251 equals that SNMP frame exactly. P-touch for Mac reads state and the
+      loaded roll only from here: width (byte 10), type 0x0A/0x0B (11), length (17),
+      and black/red when byte 25 is exactly 0x81. During a job it polls in bursts of
+      3 GETs per second; while the printer has not been read since the job started,
+      only bytes 18-21 are synthesised (00 01 00 00: reply, phase printing), never
+      the media bytes. The value is never absent: a printer that is off, missing or
+      stale reads as a "turned off" error block (persona.py).
+  - oid: "1.3.6.1.4.1.2435.3.3.9.1.46.1.1.0"
+    name: brUnknown46
+    type: integer
+    source: {const: 0}
+    context: printer
+    verified: false
+    clients: [mobile-sdk]
+    notes: >-
+      Unnamed object that some Brother client queries: a third-party bridge working
+      with the mobile app and P-touch for Mac answers INTEGER 0
+      (okms/brother-ql700-raw-bridge). Drop it if a real QL-810W(c) does not have it.

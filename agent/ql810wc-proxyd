@@ -1,0 +1,19 @@
+#!/usr/bin/python3 -IB
+"""ql810wc-proxyd: raw TCP print jobs -> USB Brother QL-810W(c) (see ql810wc/proxyd.py).
+
+Installed as /usr/local/libexec/ql810wc-proxy/ql810wc-proxyd and started by
+ql810wc-proxyd.service as "/usr/bin/python3 -I -B <this file> --config ...
+--state ...". Isolated mode (-I) keeps this script's directory off sys.path,
+so it is added here explicitly to find the ql810wc package next to it.
+"""
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.realpath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from ql810wc.proxyd import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())
