@@ -548,9 +548,9 @@ class TokenizerTest(unittest.TestCase):
         self.assertEqual(tok.requested_media["width"], 62)
 
     def test_setup_commands_alone_are_no_job(self):
-        """iPrint&Label for iOS opens a 402-byte connection before each print and
-        for Check Media (presumably 400 NULs and ESC @, not captured): the
-        printer is left at a command boundary, with no job open."""
+        """iPrint&Label for iOS opens a 402-byte connection before it prints
+        (presumably 400 NULs and ESC @, not captured): the printer is left at
+        a command boundary, with no job open."""
         cases = {
             "iPrint&Label check": rp.INVALIDATE + rp.ESC_INIT,
             "raster mode": rp.INVALIDATE + rp.ESC_INIT + b"\x1b\x69\x61\x01",

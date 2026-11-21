@@ -259,8 +259,7 @@ project never changes printer settings.
   followed. Switch the printer off and on, and print in 2-colour mode.
   `qlctl test-print --mono` refuses this combination for that reason.
 - **`connection from …: 402 bytes, no print job (…)`** from an iPhone or
-  iPad: iPrint&Label's short check before it prints and for **Check Media**.
-  Nothing is wrong.
+  iPad: iPrint&Label's short check before it prints. Nothing is wrong.
 - **`result torn`**: the connection ended abnormally before the end of the
   job: reset by the client, no data for `RAW_IDLE_TIMEOUT` (default 300 s),
   or a job larger than `MAX_JOB_BYTES` (default 16 MiB). When the detail

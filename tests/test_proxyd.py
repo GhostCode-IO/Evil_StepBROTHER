@@ -954,7 +954,7 @@ class ColorCheckTest(unittest.TestCase):
 
 class SetupConnectionTest(unittest.TestCase):
     """A connection with nothing but NULs and set-up commands is no job:
-    iPrint&Label for iOS sends one before each print and for Check Media."""
+    iPrint&Label for iOS presumably sends one before it prints."""
 
     def test_iprint_check_is_not_a_job(self):
         cases = {

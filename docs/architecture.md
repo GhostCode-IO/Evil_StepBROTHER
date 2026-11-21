@@ -205,7 +205,8 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
 - **Set-up commands:** `ESC @`, `ESC i a 01` and `ESC i !` are not job
   content either. A connection with nothing but NULs, set-up commands and
   `ESC i S` is no job. iPrint&Label for iOS opens a 402-byte connection of
-  its own before each print and for Check Media; 400 NULs and `ESC @` fit
+  its own before it prints (two before the one print observed; a later
+  **Check Media** tap sent no data to TCP 9100); 400 NULs and `ESC @` fit
   that size, but its content was not captured. Such bytes are forwarded, the
   printer is left at a command boundary and is not resynchronised, and the
   journal line `connection from …: <n> bytes, no print job (NUL bytes …,

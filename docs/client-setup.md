@@ -125,15 +125,22 @@ box, read the loaded roll with **Check Media** and printed.
    works, not a limitation of the box.
 5. Print. With DK-22251 loaded, follow the [media rules](#media-rules).
 
-Before it prints, and for **Check Media**, the app opens a short connection
-to TCP 9100 (402 bytes, no label) and closes it. What it sends was not
-captured; 400 NULs and `ESC @` fit its size. If it holds nothing but NULs,
+Before it prints, the app opens a short connection to TCP 9100 (402 bytes,
+no label) and closes it; on 2026-11-21 it opened two before its print. What
+it sends was not captured; 400 NULs and `ESC @` fit its size. If it holds
+nothing but NULs,
 set-up commands and status requests, the box forwards those bytes and does
 not count them as a job, and the journal shows
 `connection from …: 402 bytes, no print job (…)`. If the journal shows a
 `job from …: 402 bytes …` line instead, the check holds more and the box
 records it as a job (`qlctl status` and `selftest.sh` then show it as the
 last job).
+
+Later on 2026-11-21 another **Check Media** tap sent no data to TCP 9100:
+`ql810wc-proxyd`'s journal had no entry after it (with the printer ready, a
+connection that sends no data is logged only with `LOG_LEVEL="DEBUG"`). The
+app reads the roll some other way, presumably the box's SNMP status, which
+carries the loaded roll (not captured).
 
 Not checked yet: which of the box's answers (Bonjour or SNMP) the app uses
 to find the box and to read the roll. If the app does not find the box, the

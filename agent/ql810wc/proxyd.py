@@ -35,7 +35,7 @@ connection goes through these states::
 * **Before a job** - NULs and the set-up commands (``ESC @``, ``ESC i a 01``,
   ``ESC i !``) and ``ESC i S`` are no job: a read that holds nothing else is
   forwarded at once (iPrint&Label for iOS opens a 402-byte connection before
-  each print and for Check Media, presumably 400 NULs and ``ESC @``). A read
+  it prints, presumably 400 NULs and ``ESC @``). A read
   that ends inside a command keeps that command back until it is complete,
   and a connection that ends first never sends it, so the printer never
   waits inside a command because of where a read ended. The same applies

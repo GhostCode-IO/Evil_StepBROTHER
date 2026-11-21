@@ -560,8 +560,8 @@ def _is_setup_command(kind: str, params: bytes) -> bool:
     command mode) and ``ESC i !`` (status notifications). Like ``ESC @``, they
     leave the printer at a command boundary with no job open, and clients send
     them on their own as well as at the start of a job (iPrint&Label for iOS
-    opens a 402-byte connection before each print and for Check Media,
-    presumably 400 NULs and ``ESC @``)."""
+    opens a 402-byte connection before it prints, presumably 400 NULs and
+    ``ESC @``)."""
     if kind == "command_mode":
         return params[0] == _RASTER_COMMAND_MODE
     return kind == "auto_status"
