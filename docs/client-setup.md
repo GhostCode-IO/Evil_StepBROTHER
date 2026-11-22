@@ -11,7 +11,7 @@ empty, the box's short host name.
 |---|---|
 | P-touch Editor 5.3 for Mac | verified with 5.3.23: discovery, installed roll, black and two-colour prints |
 | Brother iPrint&Label for iOS | verified (2026-11-21): finds the box, reads the loaded roll with **Check Media**, prints |
-| Other Mac applications with Brother's QL-810W driver for macOS | partly verified (2026-11-21): macOS adds the box from Bonjour; the driver's black/red output printed correctly (checked by eye) and its monochrome output was refused, both sent from a Mac straight to TCP 9100; a monochrome job from PowerPoint through a macOS print queue was refused too; a black/red print through a print queue is not tested yet |
+| Other Mac applications with Brother's QL-810W driver for macOS | verified (2026-11-21 and 2026-11-22): macOS adds the box from Bonjour; 2-Color prints from PowerPoint through the macOS print queue come out black and red (checked by eye); with DK-22251 loaded the box refuses the driver's default colour (Monochrome) and its default paper size (`1.1" x 3.5"`) |
 | P-touch Editor for Windows with Brother's QL-810W(c) driver | untested |
 | Brother iPrint&Label for Android | untested |
 
@@ -112,7 +112,9 @@ is `29 mm x 90 mm`, `7" Postage Label` is `62 mm x 184 mm Postage Label`,
    portrait. That is the size of the driver's `2.4"` paper. The driver
    cannot print within about 3 mm of the top and bottom edges and 1.5 mm of
    the sides, so keep the content inside that.
-2. **File → Print**, with the box's printer selected:
+2. **File → Print**, with the box's printer selected, and set the
+   following (on the tested Mac, Brother's **Basic** and **Advanced**
+   panels were under the dialog's **Printer Options**):
    - **Paper Size: `2.4"`** (62 × 100 mm). `7" Postage Label`,
      `8" Postage Label` and `Binder 2" - Spine` are longer sizes on the same
      tape. `2.4" x2`, `x3` and `x4` (a wider page split into two to four
@@ -137,7 +139,10 @@ is `29 mm x 90 mm`, `7" Postage Label` is `62 mm x 184 mm Postage Label`,
      the box refuses a two-colour job in high resolution on DK-22251.
 3. **Presets → Save Current Settings as Preset…**, and choose that preset
    whenever you print on this roll. Otherwise the dialog may start from
-   Brother's defaults or from the settings used last.
+   Brother's defaults or from the settings used last. A preset keeps the
+   Length it had when it was saved, so check Length before you save it: a
+   saved preset that had kept 69.1 mm cut a 100 mm slide short at about
+   69 mm (2026-11-22, below).
 
 Optional: make `2.4"` and 2-Color the defaults of the Mac's queue, in
 Terminal on the Mac (it asks for an administrator password). `<queue>` is
@@ -161,15 +166,18 @@ these defaults. Avoid custom paper sizes for now: they are untested through
 the queue, and Brother's filter crashes on a paper name it does not know.
 
 When the box refuses a job, nothing prints. macOS shows a small job as
-completed, because the reset arrives after its last write. A larger job can
-pause the queue instead, as the queue macOS creates for the box stops on an
-error (its `printer-error-policy` is `stop-printer`): delete the job in the
-queue's window, then resume the queue. To have such jobs dropped instead,
-run `sudo lpadmin -p <queue> -o printer-error-policy=abort-job`.
+completed, because the reset arrives after its last write: a refused job of
+about 11 KB from PowerPoint was listed as completed, and the queue stayed
+enabled (2026-11-22). A larger job can pause the queue instead, as the
+queue macOS creates for the box stops on an error (its
+`printer-error-policy` is `stop-printer`). That has not been seen yet; if
+it happens, delete the job in the queue's window, then resume the queue.
+To have such jobs dropped instead, run
+`sudo lpadmin -p <queue> -o printer-error-policy=abort-job`.
 
 The queue tells macOS that the printer is monochrome (the driver's PPD sets
-`ColorDevice` to `False`). Whether a 2-Color print from an application
-through the queue comes out red has not been checked yet.
+`ColorDevice` to `False`). A 2-Color print through it still comes out in
+black and red (2026-11-22, below).
 
 Tested on 2026-11-21, before the box had its colour check: macOS added the
 box this way, and a job from PowerPoint reached the printer. It was
@@ -182,14 +190,39 @@ size) was sent from the Mac to TCP 9100. In Monochrome the box refused it:
 nothing printed, and the printer kept working. In 2-Color(Black/Red) it
 printed in black and red where it should (checked by eye). A second
 monochrome job from PowerPoint, through the macOS print queue, was refused
-too. Not tested yet: a 2-Color print through the queue, and a refusal by
-the media check. The paper size, Length, Margin and Quality settings above
-come from local renders of the driver, not from prints.
+too.
+
+Tested on 2026-11-22 with both checks on (`RAW_COLOR_CHECK`,
+`RAW_MEDIA_CHECK`), DK-22251 loaded, from PowerPoint through the Mac's
+print queue:
+
+- Paper `2.4"`, 2-Color(Black/Red), Length 100 mm (3.94 in the dialog,
+  which showed inches): the slide printed in black and red (checked by
+  eye). The job line read `job from <client>: 12549 bytes in 6.6 s,
+  two-color, requested 62 mm continuous, 1114 lines (94.3 mm of print),
+  flags 0x8e, result ok`. A later print at Length 100 mm had the same 1114
+  lines.
+- A saved preset that had kept Length 69.1 mm: 748 lines (63.3 mm of
+  print), a label about 69 mm long with the slide cut short. The box let
+  it through, as it cannot see this.
+- Paper `1.1" x 3.5"`, 2-Color: refused by the media check, with
+  `a job for 29x90 mm die-cut labels, but the loaded roll is 62mm
+  continuous black/red (DK-22251)`. Nothing printed. macOS listed the job
+  as completed and did not pause the queue, and the printer stayed ready
+  and printed the next job.
+
+So the paper size `2.4"`, Length, and the preset's Margin (3 mm) and
+Quality (**Give priority to print speed**) have been used in prints, and
+`1.1" x 3.5"` in a job that the box refused. The other paper sizes and
+Quality settings, and the 3 mm the driver leaves out at the top of a page
+that Length cuts short, come from local renders of the driver, not from
+prints.
 
 ## iOS: Brother iPrint&Label
 
 Verified on the tested unit on 2026-11-21: iPrint&Label for iOS finds the
-box, reads the loaded roll with **Check Media** and prints.
+box, reads the loaded roll with **Check Media** and prints. On 2026-11-22
+it printed again after **Check Media**.
 
 1. Put the iPhone or iPad on the same network as the box, inside the client
    ranges (`SNMP_PRINTER_ALLOWED_CIDRS`, and `MDNS_ALLOWED_CIDRS` when it is
@@ -202,10 +235,11 @@ box, reads the loaded roll with **Check Media** and prints.
    a 1.4" label size (38 mm continuous tape), whatever roll is loaded, and
    reads the roll only when asked; after **Check Media** it shows the roll
    that is loaded. That is how the app works, not a limitation of the box.
-   A print at 1.4" (38 mm) does not suit DK-22251. The box refuses it if
-   the app's job asks the printer to check the width; whether it does is
-   not known yet (the job line shows the flags as `flags 0x…`, and `0x04`
-   is the width). So use **Check Media** before you print.
+   A print at 1.4" (38 mm) does not suit DK-22251, and the box's media
+   check is expected to refuse it for its width: the app's 62 mm job on
+   2026-11-22, after **Check Media**, asked the printer to check the media
+   type and width (`flags 0x86` in its job line). A 1.4" print has not
+   been tried, so its flags are not known.
 5. Print. With DK-22251 loaded, follow the [media rules](#media-rules).
 
 The app also opens connections to TCP 9100 that print nothing, 402 bytes
@@ -214,8 +248,10 @@ and, between those prints, two that no print followed right away (what made
 it open those two is not known). The box logged the two before its second
 print (the first four came before it counted what such connections hold) as
 `connection from …: 402 bytes, no print job (NUL bytes 400, set-up commands 1, status requests 0)`:
-400 NULs and an `ESC @`. It forwards such bytes, does not count them as a
-job and does not resynchronise the printer after them.
+400 NULs and an `ESC @`. On 2026-11-22 the app again opened two such
+connections, with the same counts, just before its print. The box forwards
+such bytes, does not count them as a job and does not resynchronise the
+printer after them.
 
 One **Check Media** tap on 2026-11-21 sent no data to TCP 9100:
 `ql810wc-proxyd`'s journal had no entry for it (with the printer ready, a
@@ -272,10 +308,12 @@ with the box is part of the checklist below.
   data reaches the printer, nothing prints, the client's connection is
   reset, and `qlctl status` shows the job as `refused`, with the reason,
   for example `a job for 29x90 mm die-cut labels, but the loaded roll is
-  62mm continuous black/red (DK-22251)`.
+  62mm continuous black/red (DK-22251)`. On the tested unit it refused such
+  a job from PowerPoint, at the `1.1" x 3.5"` paper size of Brother's
+  driver for macOS, and the printer stayed ready (2026-11-22).
 - It also refuses a two-colour job in high resolution on DK-22251: Brother's
   guide says that high resolution cannot be used with two-colour printing,
-  and lists an error for it.
+  and lists an error for it. Not tried on the tested unit.
 - So choose the paper size of the loaded roll in the application or the
   driver. P-touch Editor takes it from the roll by itself, and iPrint&Label
   after its **Check Media**.
@@ -360,14 +398,17 @@ with the box is part of the checklist below.
 ## Acceptance checklist
 
 The box cannot see the printed label, so look at each one. After every print,
-`journalctl -u ql810wc-proxyd -n 5` on the box shows a line such as
-`job from <client>: 19000 bytes in 5.0 s, two-color, requested 62 mm
-continuous, 693 lines (58.7 mm of print), flags 0x86, 4-byte trailer, result
+`journalctl -u ql810wc-proxyd -n 5` on the box shows a line such as this
+one, from P-touch Editor for Mac:
+`job from <client>: 10523 bytes in 3.6 s, two-color, requested 62 mm
+continuous, 255 lines (21.6 mm of print), flags 0x86, 4-byte trailer, result
 ok`. The media part (`requested …`, the length of the print and the flags)
 comes from the job's `ESC i z` command; the flags say which media fields
 the printer is to check: `0x02` the type, `0x04` the width and `0x08` the
-length. P-touch Editor for Mac sends `0x86`; Brother's driver for macOS
-sends `0x8e`, or `0xce` with some **Quality** settings.
+length. P-touch Editor for Mac and iPrint&Label for iOS send `0x86`, and
+Brother's driver for macOS `0x8e` (all three seen in live jobs on the
+tested unit); in local renders the driver sent `0xce` with some
+**Quality** settings.
 
 | # | Check | Pass when | Tested unit |
 |---|---|---|---|
@@ -383,9 +424,9 @@ sends `0x8e`, or `0xce` with some **Quality** settings.
 | 10 | Checks 3 to 6 from Windows | As above | not run |
 | 11 | iPrint&Label (iOS) finds the box, then prints a label | The app finds the box; the label prints | passed (2026-11-21) |
 | 12 | iPrint&Label (iOS) with DK-22251 loaded: **Check Media** | The app shows the loaded roll | passed (2026-11-21) |
-| 13 | A Mac application through Brother's QL-810W driver, DK-22251 loaded, with the [PowerPoint settings](#printing-from-powerpoint-on-dk-22251): paper `2.4"`, **Color** 2-Color(Black/Red), Length 100 mm | The whole page prints in black and red, on a label about 100 mm long | not run through a print queue; the driver's own output, sent to TCP 9100 from a Mac, printed correctly, checked by eye (2026-11-21) |
+| 13 | A Mac application through Brother's QL-810W driver, DK-22251 loaded, with the [PowerPoint settings](#printing-from-powerpoint-on-dk-22251): paper `2.4"`, **Color** 2-Color(Black/Red), Length 100 mm | The whole page prints in black and red, on a label about 100 mm long | passed (2026-11-22): from PowerPoint through the Mac's print queue, red printed red (checked by eye), 1114 lines (94.3 mm of print); before that, the driver's own output, sent to TCP 9100 from a Mac, printed correctly (2026-11-21) |
 | 14 | The same with **Color** left at Monochrome | Nothing prints; `qlctl status` shows the job as `refused`; the printer keeps working | refused through a print queue, from PowerPoint (2026-11-21); the driver's own output, sent to TCP 9100 from a Mac, was refused and the printer kept working (2026-11-21) |
-| 15 | The same as #13 with paper `1.1" x 3.5"`, the driver's default | Nothing prints; `qlctl status` shows the job as `refused` with `a job for 29x90 mm die-cut labels, but the loaded roll is 62mm continuous black/red (DK-22251)`; the printer keeps working | not run yet: the pending live test of the media check |
+| 15 | The same as #13 with paper `1.1" x 3.5"`, the driver's default | Nothing prints; `qlctl status` shows the job as `refused` with `a job for 29x90 mm die-cut labels, but the loaded roll is 62mm continuous black/red (DK-22251)`; the printer keeps working | passed (2026-11-22): from PowerPoint through the Mac's print queue, refused with that reason (the journal); nothing printed, the printer stayed ready and printed the next job, and macOS listed the job as completed |
 
 If a check fails, note what you saw (blank label, black only, garbled, an
 error LED, the client's message), run `sudo ./selftest.sh` and `qlctl status`

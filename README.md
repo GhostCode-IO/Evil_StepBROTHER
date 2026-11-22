@@ -8,8 +8,9 @@ below) with a Brother QL-810Wc label printer on USB into what Brother's
 software takes for a networked QL-810W. P-touch Editor for Mac finds the box
 on the network, shows the roll that is loaded and prints to it in black or
 in black and red. Brother iPrint&Label for iOS finds the box and prints to
-it, and its **Check Media** reads the loaded roll. The printer only needs
-its USB cable.
+it, and its **Check Media** reads the loaded roll. Other Mac applications,
+such as PowerPoint, print to it in black and red through Brother's QL-810W
+driver for macOS. The printer only needs its USB cable.
 
 On the box the software keeps its technical names: `ql810wc-print-proxy` in
 its messages and in the one-liner's checkout
@@ -105,7 +106,7 @@ enforcing, net-snmp 5.9.5.2) with a QL-810Wc on USB.
 |---|---|---|---|
 | P-touch Editor 5.3 for Mac | verified with 5.3.23 (Bonjour) | verified: DK-22251 shown as 62 mm black/red | verified: black and black/red labels, checked by eye |
 | Brother iPrint&Label for iOS | verified (2026-11-21) | verified (2026-11-21), after the app's **Check Media** | verified (2026-11-21) |
-| Other Mac apps (for example PowerPoint) with Brother's QL-810W driver for macOS | verified (2026-11-21): macOS adds the box from Bonjour | not applicable: you choose the label size, and the box refuses one that does not suit the loaded roll | partly verified (2026-11-21): the driver's black/red output, sent from a Mac straight to TCP 9100, printed correctly (checked by eye); its monochrome output is refused, also from PowerPoint through a macOS print queue. A black/red print through a macOS print queue is not tested yet |
+| Other Mac apps (for example PowerPoint) with Brother's QL-810W driver for macOS | verified (2026-11-21): macOS adds the box from Bonjour | not applicable: you choose the label size, and the box refuses one that does not suit the loaded roll | verified (2026-11-22): black/red labels from PowerPoint through a macOS print queue, checked by eye. With DK-22251 loaded the box refuses the driver's defaults: its Monochrome (2026-11-21) and its `1.1" x 3.5"` paper size (2026-11-22) |
 | P-touch Editor for Windows with Brother's QL-810W(c) driver | untested | untested | untested |
 | BRAdmin | untested | untested | not applicable |
 | Android apps (iPrint&Label and others) | untested | untested | untested |
@@ -132,7 +133,9 @@ Also verified on the tested unit:
 - iPrint&Label for iOS reads the loaded roll from the box with its
   **Check Media** command. The app starts out with a 1.4" label size and
   does not read the roll by itself, so use **Check Media** after selecting
-  the printer. That is how the app works, not a limitation of the box.
+  the printer. That is how the app works, not a limitation of the box. A
+  62 mm print job from the app had the flags `0x86`, as P-touch Editor for
+  Mac's jobs do: it asked the printer to check the media type and width.
 - macOS adds the box as a printer straight from its Bonjour record, with
   Brother's QL-810W printer driver for macOS, so applications such as
   PowerPoint can send it jobs. Before `ql810wc-proxyd` had its colour check
@@ -145,6 +148,16 @@ Also verified on the tested unit:
   **Color** option to **2-Color(Black/Red)** and its paper size to `2.4"`
   (`62 mm` when the driver names sizes in millimetres;
   [client setup](docs/client-setup.md#macos-other-applications-brothers-driver)).
+- Printing from PowerPoint through that print queue (2026-11-22), with
+  DK-22251 loaded and both checks on. With paper `2.4"`,
+  2-Color(Black/Red) and Length 100 mm the slide printed in black and red
+  (checked by eye), although the queue tells macOS that the printer is
+  monochrome. The driver's Length sets the label length: a saved preset
+  that had kept a Length of 69.1 mm cut the 100 mm slide short at about
+  69 mm, which the box cannot see. At the driver's default paper size,
+  `1.1" x 3.5"`, the media check (`RAW_MEDIA_CHECK`) refused the job: none
+  of it reached the printer, which stayed ready and printed the next job.
+  macOS listed the refused job as completed and did not pause its queue.
 - The colour check, with DK-22251 loaded: a label rendered by Brother's
   QL-810W driver for macOS (its own filter, run by hand on a Mac) was sent
   from the Mac to TCP 9100. The Monochrome version was refused: the Mac's
@@ -174,17 +187,19 @@ Also verified on the tested unit:
   installer's network search, and the SNMP status of Windows' Standard
   TCP/IP port.
 - BRAdmin, and Android apps.
-- A black/red label printed from another Mac application through a macOS
-  print queue with Brother's QL-810W driver (**Color** set to
-  **2-Color(Black/Red)**). The driver's own output, sent to TCP 9100, printed.
-- The rules of the media check (`RAW_MEDIA_CHECK`) on the tested unit.
-  Brother documents that the printer rejects a job for other media than the
-  loaded roll, and a two-colour job in high resolution. Owners of the QL-800
-  and QL-810W report that after a media mismatch ("replace media") the
-  printer stops until someone clears it at the printer. No job has been
-  refused by the media check on the tested unit yet; that live test is
-  pending. It refuses a job the same way as the colour check, whose rule
-  and refusals are verified there.
+- What the printer itself does with a job for other media than the loaded
+  roll. Brother documents that the printer rejects such a job ("replace
+  media") and a two-colour job in high resolution, and how to clear the
+  error. Owners of the QL-800 and QL-810W report that after "replace media"
+  the printer stops until someone clears it at the printer. The box's media
+  check (`RAW_MEDIA_CHECK`) keeps such jobs from the printer, and refused
+  one on the tested unit (see above). Its high-resolution rule has not been
+  tried there.
+- iPrint&Label for iOS printing at its 1.4" start size while DK-22251 is
+  loaded, which the media check is expected to refuse.
+- With Brother's driver for macOS: custom paper sizes, the optional
+  `lpadmin` defaults for the Mac's queue, and whether a larger refused job
+  pauses that queue.
 - The plain QL-810W (firmware 1.x). It reports the same USB ID and protocol,
   so it is expected to work.
 - Die-cut DK-11201 labels printed from P-touch, and P-touch noticing a roll
@@ -559,8 +574,9 @@ as well: `sudo rm -rf /usr/local/src/ql810wc-print-proxy`.
 - **Printer:** a Brother QL-810Wc on USB, powered on, with **Editor Lite off**
   (green LED dark). With Editor Lite on, the printer shows up as a USB drive
   (`04f9:209f`) instead of a printer (`04f9:209c`).
-- **Clients:** P-touch Editor 5.3 for Mac (verified with 5.3.23) or Brother
-  iPrint&Label for iOS, on a network listed in `SNMP_PRINTER_ALLOWED_CIDRS`
+- **Clients:** P-touch Editor 5.3 for Mac (verified with 5.3.23), Brother
+  iPrint&Label for iOS, or another Mac application with Brother's QL-810W
+  driver for macOS, on a network listed in `SNMP_PRINTER_ALLOWED_CIDRS`
   (setup.sh sets it to the box's own network unless you pass
   `--clients`). P-touch Editor for Windows with Brother's driver and a raw
   TCP/IP port should work, but is untested.
@@ -901,10 +917,13 @@ Details: [docs/security.md](docs/security.md).
   clears it at the printer. So `ql810wc-proxyd` refuses such a job too,
   before its print data reaches the printer (`RAW_MEDIA_CHECK`). An example
   is a job at the default paper size of Brother's driver for macOS,
-  `1.1" x 3.5"` (29 × 90 mm die-cut labels), while DK-22251 is loaded. This
-  rule is not yet tested on the tested unit. The box sees only what the job
-  asks for: on continuous tape a label that is cut too short, a layout that
-  does not fit and a blank label all go through. See
+  `1.1" x 3.5"` (29 × 90 mm die-cut labels), while DK-22251 is loaded: on
+  the tested unit the box refused such a job from PowerPoint, and the
+  printer stayed ready. What the printer itself does with such a job, and
+  the high-resolution rule, have not been tried there. The box sees only
+  what the job asks for: on continuous tape a label that is cut too short
+  (for example by a saved preset's Length), a layout that does not fit and
+  a blank label all go through. See
   [client setup](docs/client-setup.md#media-rules).
 - **One network segment for discovery.** Bonjour does not cross routers.
   Clients on another subnet do not find the box by themselves; P-touch for

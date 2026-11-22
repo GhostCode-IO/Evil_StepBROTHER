@@ -59,7 +59,7 @@ journalctl -u ql810wc-proxyd -n 30 --no-pager
 | P-touch for Mac or iPrint&Label for iOS does not list the printer | [Bonjour checks](#bonjour-checks), [Firewall checks](#firewall-checks) |
 | iPrint&Label (iOS) shows a 1.4" label instead of the loaded roll | Use the app's **Check Media** ([client setup](client-setup.md#ios-brother-iprintlabel)) |
 | A job from PowerPoint or another Mac application prints nothing (macOS may show it as completed, or pause its queue), or stops the printer | [Printer errors](#the-printer-shows-an-error-or-nothing-prints): `qlctl status` shows `refused` and why; for DK-22251 set the driver's **Color** to **2-Color(Black/Red)** and its paper size to `2.4"` or `62 mm` ([client setup](client-setup.md#printing-from-powerpoint-on-dk-22251)) |
-| A label from a Mac application is cut short | Brother's **Basic → Length** is shorter than the page ([client setup](client-setup.md#printing-from-powerpoint-on-dk-22251)) |
+| A label from a Mac application is cut short | Brother's **Basic → Length** is shorter than the page. A saved preset keeps the Length it was saved with: check the preset's Length ([client setup](client-setup.md#printing-from-powerpoint-on-dk-22251)) |
 | `replace media` in `qlctl status` or the selftest | [Printer errors](#the-printer-shows-an-error-or-nothing-prints): clear it at the printer |
 
 ## setup.sh problems
@@ -250,8 +250,8 @@ project never changes printer settings.
   the box's checks kept the job from the printer, because the loaded roll
   cannot take it. Nothing printed, and the client's connection was reset.
   The application may still show the print as completed (macOS does when the
-  reset arrives after its last write; with a larger job it may pause its
-  queue instead, see [client setup](client-setup.md#printing-from-powerpoint-on-dk-22251)).
+  reset arrives after its last write). With a larger job macOS may pause its
+  queue instead, which has not been seen yet (see [client setup](client-setup.md#printing-from-powerpoint-on-dk-22251)).
   `qlctl status` shows the reason too. Change the job in the client and
   print it again:
   - `a black-only job, but the loaded roll, … (DK-22251), takes two-color
@@ -266,10 +266,12 @@ project never changes printer settings.
   - `a job for 29x90 mm die-cut labels, but the loaded roll is 62mm
     continuous black/red (DK-22251)` (the media check, `RAW_MEDIA_CHECK`):
     the job asks for other media than the loaded roll, and Brother documents
-    that the printer rejects it. Choose the loaded roll's paper size in the
-    client (for DK-22251, `2.4"` or `62 mm` in Brother's driver for macOS,
-    whose default is `1.1" x 3.5"`), use **Check Media** in iPrint&Label,
-    or load the roll the job is for.
+    that the printer rejects it. On the tested unit the box refused a
+    2-Color job from PowerPoint at `1.1" x 3.5"` with this reason, and the
+    printer stayed ready. Choose the loaded roll's paper size in the client
+    (for DK-22251, `2.4"` or `62 mm` in Brother's driver for macOS, whose
+    default is `1.1" x 3.5"`), use **Check Media** in iPrint&Label, or load
+    the roll the job is for.
   - `a black-only job for 29x90 mm die-cut labels, but the loaded roll is
     62mm continuous black/red (DK-22251), which takes two-color jobs only`:
     both at once. Fix the paper size and the colour.

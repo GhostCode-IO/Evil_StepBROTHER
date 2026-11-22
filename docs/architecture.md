@@ -156,7 +156,10 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
     11's low nibble, the width (unless 0) with byte 10, and the length, on a
     die-cut roll only, with byte 17, within ±1 mm (`LENGTH_TOLERANCE_MM`:
     the printer reports a rounded length). Continuous tape takes any length,
-    and the raster line count is never compared. Also refused: a two-colour
+    and the raster line count is never compared. Live jobs on the tested
+    unit flagged the type and width (`0x86`: P-touch Editor for Mac,
+    iPrint&Label for iOS) or the type, width and length (`0x8e`: Brother's
+    driver for macOS on its network queue). Also refused: a two-colour
     job with `ESC i K` bit 6 (high resolution) on a black/red roll. Brother's
     raster reference says that the printer checks only the flagged fields
     and reports a mismatch as error information 2 bit 0, "replace media";
@@ -164,7 +167,10 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
     two-colour printing, and lists a "Two-color media high resolution
     printing error". QL-800 and QL-810W owners report that after "replace
     media" the printer stops until the roll cover is opened and closed
-    **(unverified on the QL-810Wc)**. The media rules are judged only while
+    **(unverified on the QL-810Wc)**. On the tested unit the check refused
+    a job for 29 × 90 mm die-cut labels from Brother's driver for macOS
+    while DK-22251 was loaded; the high-resolution rule has not been tried
+    there. The media rules are judged only while
     the frame shows no fault (cover open, no or end of media, any error):
     through a fault the printer holds jobs (third-party reports) and
     presumably checks the roll it has when it resumes **(unverified)**. The
@@ -182,7 +188,9 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
   `refused` with the reason, and the client gets a RST once that is
   written. Over raw TCP the RST is all a client learns: macOS's CUPS
   backend shows the job as completed when the RST arrives after its last
-  write. Anything uncertain goes through unchecked. Nothing is judged for a
+  write (on the tested unit, a refused job of about 11 KB from PowerPoint
+  was listed as completed, and the Mac's queue was not paused). Anything
+  uncertain goes through unchecked. Nothing is judged for a
   stream that turns opaque before the job shows its mode, without a recent
   frame, without a roll, or after 256 KiB held before the job shows its
   mode (`_CHECK_HOLD_LIMIT`: no `g` or `w` row and no print command yet;
@@ -264,9 +272,10 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
   its own: six on 2026-11-21, two just before each of its two prints and
   two between them that no print followed right away (a **Check Media** tap
   that day sent no data to TCP 9100). The two before its second print, the
-  only ones whose content was counted (an older `ql810wc-proxyd` logged the
+  first ones whose content was counted (an older `ql810wc-proxyd` logged the
   first four as jobs that ended early), held 400 NULs and an `ESC @`
-  (`NUL bytes 400, set-up commands 1, status requests 0`). Such bytes are
+  (`NUL bytes 400, set-up commands 1, status requests 0`). So did the two
+  it opened just before its print on 2026-11-22. Such bytes are
   forwarded, the
   printer is left at a command boundary and is not resynchronised, and the
   journal line `connection from …: <n> bytes, no print job (NUL bytes …,
