@@ -549,8 +549,9 @@ class TokenizerTest(unittest.TestCase):
 
     def test_setup_commands_alone_are_no_job(self):
         """iPrint&Label for iOS opens 402-byte connections that print nothing
-        (presumably 400 NULs and ESC @, not captured): the printer is left at
-        a command boundary, with no job open."""
+        (the two the tested unit counted held 400 NULs and ESC @; the counts
+        do not show their order, and the first case sends the NULs first): the
+        printer is left at a command boundary, with no job open."""
         cases = {
             "iPrint&Label's 402 bytes": rp.INVALIDATE + rp.ESC_INIT,
             "raster mode": rp.INVALIDATE + rp.ESC_INIT + b"\x1b\x69\x61\x01",

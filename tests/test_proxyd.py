@@ -954,8 +954,8 @@ class ColorCheckTest(unittest.TestCase):
 
 class SetupConnectionTest(unittest.TestCase):
     """A connection with nothing but NULs and set-up commands is no job:
-    iPrint&Label for iOS presumably opens such connections (402 bytes, no
-    print)."""
+    iPrint&Label for iOS opens such connections; the two the tested unit
+    counted held 400 NULs and ESC @, with the counts the first case expects."""
 
     def test_iprint_402_byte_connection_is_not_a_job(self):
         cases = {

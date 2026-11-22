@@ -125,19 +125,16 @@ box, reads the loaded roll with **Check Media** and prints.
    works, not a limitation of the box.
 5. Print. With DK-22251 loaded, follow the [media rules](#media-rules).
 
-The app also opens connections to TCP 9100 that print nothing (402 bytes
-each). On 2026-11-21 it opened four: two just before its print, and
-two at other times, with no print from the app after them. Their content was
-not captured, and what makes the app open them is not known; 400 NULs and
-`ESC @` fit their size. If one holds nothing but
-NULs, set-up commands and status requests, the box forwards those bytes and
-does not count them as a job, and the journal shows
-`connection from …: 402 bytes, no print job (…)`. If the journal shows a
-`job from …: 402 bytes …` line instead, the connection holds more and the
-box records it as a job (`qlctl status` and `selftest.sh` then show it as
-the last job).
+The app also opens connections to TCP 9100 that print nothing, 402 bytes
+each. On 2026-11-21 it opened six: two just before each of its two prints,
+and, between those prints, two that no print followed right away (what made
+it open those two is not known). The box logged the two before its second
+print (the first four came before it counted what such connections hold) as
+`connection from …: 402 bytes, no print job (NUL bytes 400, set-up commands 1, status requests 0)`:
+400 NULs and an `ESC @`. It forwards such bytes, does not count them as a
+job and does not resynchronise the printer after them.
 
-Later on 2026-11-21 another **Check Media** tap sent no data to TCP 9100:
+One **Check Media** tap on 2026-11-21 sent no data to TCP 9100:
 `ql810wc-proxyd`'s journal had no entry for it (with the printer ready, a
 connection that sends no data is logged only with `LOG_LEVEL="DEBUG"`). The
 app reads the roll some other way, presumably the box's SNMP status, which

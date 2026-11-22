@@ -35,7 +35,8 @@ connection goes through these states::
 * **Before a job** - NULs and the set-up commands (``ESC @``, ``ESC i a 01``,
   ``ESC i !``) and ``ESC i S`` are no job: a read that holds nothing else is
   forwarded at once (iPrint&Label for iOS opens 402-byte connections that
-  print nothing, presumably 400 NULs and ``ESC @``). A read
+  print nothing; the two the tested unit counted held 400 NULs and
+  ``ESC @``). A read
   that ends inside a command keeps that command back until it is complete,
   and a connection that ends first never sends it, so the printer never
   waits inside a command because of where a read ended. The same applies
@@ -1739,8 +1740,8 @@ class ProxyDaemon:
         problem = abort.detail if abort is not None else sess.error
         if not jobs:
             if sess.bytes_in:
-                # What it held (no job: all of it is in this segment). iPrint&Label's
-                # 402-byte connections presumably end here.
+                # What it held (no job: all of it is in this segment). The two
+                # iPrint&Label 402-byte connections the tested unit counted ended here.
                 tok = seg.tok
                 cut = (f"; the last {len(seg.pending)} bytes, an incomplete command, were not sent"
                        if seg.pending else "")
