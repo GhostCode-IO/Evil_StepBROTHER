@@ -284,12 +284,12 @@ entry says whether it is verified).
   - 10:35:38, PowerPoint again, with the owner's saved preset (paper `2.4"`,
     2-Color, Quality "Give priority to print speed", Margin 3 mm), which had
     kept Length 69.1 mm (the queue's last-used Length in the entry above;
-    the Mac's preset file holds `BrTapeLength` "69.1"):
+    the Mac's preset file then held `BrTapeLength` "69.1"):
     `job from <client>: 9497 bytes in 5.2 s, two-color, requested 62 mm
     continuous, 748 lines (63.3 mm of print), flags 0x8e, result ok`. The
     label came out about 69 mm long, the slide cut short. The box cannot see
-    this, and the docs expected it. A preset keeps the Length it had when it
-    was saved.
+    this, and the docs expected it. The docs then advised checking Length
+    before saving a preset; that evening this did not help (below).
   - 10:37:49, iPrint&Label for iOS, from the iPhone, after **Check Media**:
     two `connection from <client>: 402 bytes, no print job (NUL bytes 400,
     set-up commands 1, status requests 0)` lines, then at 10:37:53 `job
@@ -331,6 +331,44 @@ entry says whether it is verified).
     high-resolution rule, iPrint&Label at its 1.4" start size, custom paper
     sizes, the optional `lpadmin` defaults of the Mac's queue, and a queue
     paused by a larger refused job.
+  - **That evening**, from the Mac, with the box unchanged (e6530b9, both
+    checks on, DK-22251 loaded). The owner had saved the preset again with
+    a new Length, as the docs then advised. In order:
+    - 17:21:23 and 17:21:56, PowerPoint through the Mac's queue, each
+      `job from <client>: 13874 bytes in 5.2 s, two-color, requested 62 mm
+      continuous, 748 lines (63.3 mm of print), flags 0x8e, result ok`:
+      Length 69.1 mm. Both printed, cut short.
+    - 17:23:13 and 17:23:51, through the Mac's queue, each `refused a print
+      job from <client>: a black-only job, but the loaded roll, 62mm
+      continuous black/red (DK-22251), takes two-color jobs only. None of
+      its print data was sent to the printer`, with the job line `job from
+      <client>: 7075 bytes in 0.1 s, black only, requested 62 mm
+      continuous, 1114 lines (94.3 mm of print), flags 0x8e, result
+      refused (…)`: Monochrome.
+    - 17:24:07, the same refusal, with `job from <client>: 4179 bytes in
+      0.1 s, black only, requested 62 mm continuous, 748 lines (63.3 mm of
+      print), flags 0x8e, result refused (…)`: Monochrome and Length
+      69.1 mm.
+    - 17:25:58, `job from <client>: 11579 bytes in 6.5 s, two-color,
+      requested 62 mm continuous, 1114 lines (94.3 mm of print), flags
+      0x8e, result ok`: printed whole.
+    - 17:26:18, P-touch Editor for Mac: `job from <client>: 10523 bytes in
+      3.5 s, two-color, … 255 lines (21.6 mm of print), flags 0x86, 4-byte
+      trailer, result ok`.
+    - Afterwards `qlctl status` showed the printer ready, with DK-22251 and
+      no errors, and the Mac's queue was idle and enabled.
+  - **The owner's report:** saved presets did not keep the settings
+    properly in PowerPoint on macOS, and prints from PowerPoint then failed
+    or came out wrong. The owner decided to stop using PowerPoint for
+    labels for now.
+  - So on the tested Mac, Brother's print dialog did not keep **Color** and
+    **Length** between prints, even with a saved preset: Monochrome and
+    Length 69.1 mm came back, as the journal shows. Why is not known. It
+    may be that the preset did not save Brother's settings, or that the
+    dialog started from Brother's defaults or from the last-used settings.
+    The docs no longer advise a preset. They say to check **Paper Size**,
+    **Color** and **Length** before every print, and point to P-touch
+    Editor for Mac and iPrint&Label for iOS for everyday labels.
 
 ## Research summary
 

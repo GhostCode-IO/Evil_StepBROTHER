@@ -11,7 +11,7 @@ empty, the box's short host name.
 |---|---|
 | P-touch Editor 5.3 for Mac | verified with 5.3.23: discovery, installed roll, black and two-colour prints |
 | Brother iPrint&Label for iOS | verified (2026-11-21): finds the box, reads the loaded roll with **Check Media**, prints |
-| Other Mac applications with Brother's QL-810W driver for macOS | verified (2026-11-21 and 2026-11-22): macOS adds the box from Bonjour; 2-Color prints from PowerPoint through the macOS print queue come out black and red (checked by eye); with DK-22251 loaded the box refuses the driver's default colour (Monochrome) and its default paper size (`1.1" x 3.5"`) |
+| Other Mac applications with Brother's QL-810W driver for macOS | verified (2026-11-21 and 2026-11-22): macOS adds the box from Bonjour; 2-Color prints from PowerPoint through the macOS print queue come out black and red (checked by eye); with DK-22251 loaded the box refuses the driver's default colour (Monochrome) and its default paper size (`1.1" x 3.5"`). Not reliable for everyday labels: the print dialog did not keep **Color** and **Length** between prints (2026-11-22) |
 | P-touch Editor for Windows with Brother's QL-810W(c) driver | untested |
 | Brother iPrint&Label for Android | untested |
 
@@ -80,6 +80,14 @@ Applications other than P-touch Editor (PowerPoint, Word, a browser) print
 through a macOS printer. That needs Brother's **QL-810W printer driver for
 macOS**, from Brother's support site.
 
+Printing from PowerPoint this way works when the print dialog's settings
+are right: on the tested unit it printed in black and red (checked by eye).
+It is not reliable for everyday labels: on the tested Mac the dialog did
+not keep **Color** and **Length** between prints
+([step 3 below](#printing-from-powerpoint-on-dk-22251)). For everyday
+labels, use P-touch Editor for Mac or iPrint&Label for iOS: they read the
+loaded roll themselves (iPrint&Label with its **Check Media**).
+
 1. System Settings → Printers & Scanners → **Add Printer**. The box is
    listed as **`Brother QL-810W [<host>]`** (its Bonjour record). Add it
    with the driver **Brother QL-810W CUPS**; select the driver yourself if
@@ -137,12 +145,12 @@ is `29 mm x 90 mm`, `7" Postage Label` is `62 mm x 184 mm Postage Label`,
      priority to print quality**, never **High resolution**. Brother's guide
      says that high resolution cannot be used with two-colour printing, and
      the box refuses a two-colour job in high resolution on DK-22251.
-3. **Presets → Save Current Settings as Preset…**, and choose that preset
-   whenever you print on this roll. Otherwise the dialog may start from
-   Brother's defaults or from the settings used last. A preset keeps the
-   Length it had when it was saved, so check Length before you save it: a
-   saved preset that had kept 69.1 mm cut a 100 mm slide short at about
-   69 mm (2026-11-22, below).
+3. **Check Paper Size, Color and Length in the print dialog before every
+   print.** On the tested Mac, Color and Length did not stay set between
+   prints, even with a saved preset (2026-11-22): Monochrome and a Length
+   of 69.1 mm came back. The box refuses a print left in Monochrome or at a
+   paper size for other media, so nothing reaches the printer then; the box
+   cannot catch a Length that is too short, which prints a label cut short.
 
 Optional: make `2.4"` and 2-Color the defaults of the Mac's queue, in
 Terminal on the Mac (it asks for an administrator password). `<queue>` is
@@ -160,8 +168,8 @@ of 29 × 90 mm die-cut labels, but a job that names no colour stays
 Monochrome, because the driver takes the colour only from the job's own
 options (both seen in local renders of the driver, not yet through the
 queue). The colour default can only change what the print dialog starts
-with, and that has not been checked yet, so keep choosing 2-Color in the
-dialog or the preset. Adding the printer again, or a driver update, undoes
+with, and that has not been checked yet, so check **Color** in the dialog
+before every print. Adding the printer again, or a driver update, undoes
 these defaults. Avoid custom paper sizes for now: they are untested through
 the queue, and Brother's filter crashes on a paper name it does not know.
 
@@ -202,21 +210,28 @@ print queue:
   two-color, requested 62 mm continuous, 1114 lines (94.3 mm of print),
   flags 0x8e, result ok`. A later print at Length 100 mm had the same 1114
   lines.
-- A saved preset that had kept Length 69.1 mm: 748 lines (63.3 mm of
-  print), a label about 69 mm long with the slide cut short. The box let
-  it through, as it cannot see this.
+- Length 69.1 mm, with a saved preset: 748 lines (63.3 mm of print), a
+  label about 69 mm long with the slide cut short. The box let it through,
+  as it cannot see this.
 - Paper `1.1" x 3.5"`, 2-Color: refused by the media check, with
   `a job for 29x90 mm die-cut labels, but the loaded roll is 62mm
   continuous black/red (DK-22251)`. Nothing printed. macOS listed the job
   as completed and did not pause the queue, and the printer stayed ready
   and printed the next job.
+- That evening the preset had been saved again with a new Length, but the
+  dialog did not keep **Color** and **Length**: Monochrome and a Length of
+  69.1 mm came back. The box refused three prints in Monochrome, and none
+  of their print data reached the printer. Two 2-Color prints at Length
+  69.1 mm (748 lines) printed, cut short. A 2-Color print with 1114 lines
+  printed whole. Afterwards the printer was ready, with no errors, and the
+  Mac's queue was idle and enabled. Why the dialog lost these settings is
+  not known.
 
-So the paper size `2.4"`, Length, and the preset's Margin (3 mm) and
-Quality (**Give priority to print speed**) have been used in prints, and
-`1.1" x 3.5"` in a job that the box refused. The other paper sizes and
-Quality settings, and the 3 mm the driver leaves out at the top of a page
-that Length cuts short, come from local renders of the driver, not from
-prints.
+So the paper size `2.4"`, Length, Margin 3 mm and Quality **Give priority
+to print speed** have been used in prints, and `1.1" x 3.5"` in a job that
+the box refused. The other paper sizes and Quality settings, and the 3 mm
+the driver leaves out at the top of a page that Length cuts short, come
+from local renders of the driver, not from prints.
 
 ## iOS: Brother iPrint&Label
 

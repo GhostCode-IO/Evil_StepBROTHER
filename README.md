@@ -10,7 +10,10 @@ on the network, shows the roll that is loaded and prints to it in black or
 in black and red. Brother iPrint&Label for iOS finds the box and prints to
 it, and its **Check Media** reads the loaded roll. Other Mac applications,
 such as PowerPoint, print to it in black and red through Brother's QL-810W
-driver for macOS. The printer only needs its USB cable.
+driver for macOS when the print dialog's settings are right. For everyday
+labels that is not reliable: on the tested Mac the dialog did not keep its
+Color and Length settings between prints ([Limitations](#limitations)).
+The printer only needs its USB cable.
 
 On the box the software keeps its technical names: `ql810wc-print-proxy` in
 its messages and in the one-liner's checkout
@@ -106,7 +109,7 @@ enforcing, net-snmp 5.9.5.2) with a QL-810Wc on USB.
 |---|---|---|---|
 | P-touch Editor 5.3 for Mac | verified with 5.3.23 (Bonjour) | verified: DK-22251 shown as 62 mm black/red | verified: black and black/red labels, checked by eye |
 | Brother iPrint&Label for iOS | verified (2026-11-21) | verified (2026-11-21), after the app's **Check Media** | verified (2026-11-21) |
-| Other Mac apps (for example PowerPoint) with Brother's QL-810W driver for macOS | verified (2026-11-21): macOS adds the box from Bonjour | not applicable: you choose the label size, and the box refuses one that does not suit the loaded roll | verified (2026-11-22): black/red labels from PowerPoint through a macOS print queue, checked by eye. With DK-22251 loaded the box refuses the driver's defaults: its Monochrome (2026-11-21) and its `1.1" x 3.5"` paper size (2026-11-22) |
+| Other Mac apps (for example PowerPoint) with Brother's QL-810W driver for macOS | verified (2026-11-21): macOS adds the box from Bonjour | not applicable: you choose the label size, and the box refuses one that does not suit the loaded roll | verified (2026-11-22): black/red labels from PowerPoint through a macOS print queue, checked by eye. With DK-22251 loaded the box refuses the driver's defaults: its Monochrome (2026-11-21) and its `1.1" x 3.5"` paper size (2026-11-22). Not reliable for everyday labels: the print dialog did not keep **Color** and **Length** between prints (2026-11-22) |
 | P-touch Editor for Windows with Brother's QL-810W(c) driver | untested | untested | untested |
 | BRAdmin | untested | untested | not applicable |
 | Android apps (iPrint&Label and others) | untested | untested | untested |
@@ -152,12 +155,15 @@ Also verified on the tested unit:
   DK-22251 loaded and both checks on. With paper `2.4"`,
   2-Color(Black/Red) and Length 100 mm the slide printed in black and red
   (checked by eye), although the queue tells macOS that the printer is
-  monochrome. The driver's Length sets the label length: a saved preset
-  that had kept a Length of 69.1 mm cut the 100 mm slide short at about
-  69 mm, which the box cannot see. At the driver's default paper size,
-  `1.1" x 3.5"`, the media check (`RAW_MEDIA_CHECK`) refused the job: none
-  of it reached the printer, which stayed ready and printed the next job.
-  macOS listed the refused job as completed and did not pause its queue.
+  monochrome. The driver's Length sets the label length: at a Length of
+  69.1 mm the 100 mm slide was cut short at about 69 mm, which the box
+  cannot see. At the driver's default paper size, `1.1" x 3.5"`, the media
+  check (`RAW_MEDIA_CHECK`) refused the job: none of it reached the
+  printer, which stayed ready and printed the next job. macOS listed the
+  refused job as completed and did not pause its queue. That evening the
+  print dialog did not keep **Color** and **Length** between prints, even
+  with a saved preset: two prints at Length 69.1 mm came out cut short, and
+  the box refused three in Monochrome ([Limitations](#limitations)).
 - The colour check, with DK-22251 loaded: a label rendered by Brother's
   QL-810W driver for macOS (its own filter, run by hand on a Mac) was sent
   from the Mac to TCP 9100. The Monochrome version was refused: the Mac's
@@ -921,10 +927,24 @@ Details: [docs/security.md](docs/security.md).
   the tested unit the box refused such a job from PowerPoint, and the
   printer stayed ready. What the printer itself does with such a job, and
   the high-resolution rule, have not been tried there. The box sees only
-  what the job asks for: on continuous tape a label that is cut too short
-  (for example by a saved preset's Length), a layout that does not fit and
-  a blank label all go through. See
+  what the job asks for: on continuous tape a label that the driver cuts
+  too short (its **Length** setting), a layout that does not fit and a
+  blank label all go through. See
   [client setup](docs/client-setup.md#media-rules).
+- **Printing from PowerPoint is not reliable for everyday labels.** It
+  works through Brother's QL-810W driver for macOS when the print dialog's
+  settings are right: on the tested unit it printed in black and red
+  (checked by eye). But on the tested Mac, **Color** and
+  **Length** did not stay set between prints, even with a saved preset
+  (2026-11-22): Monochrome and a Length of 69.1 mm came back. Why is not
+  known. With DK-22251 loaded the box refuses a print left in Monochrome or
+  at a paper size for other media, so nothing reaches the printer then; the
+  box cannot catch a Length that is too short, which prints a label cut short.
+  Check **Paper Size**, **Color** and **Length** in the print dialog before
+  every print. For everyday labels, use P-touch Editor for Mac or
+  iPrint&Label for iOS: they read the roll themselves (iPrint&Label with
+  its **Check Media**). See
+  [client setup](docs/client-setup.md#printing-from-powerpoint-on-dk-22251).
 - **One network segment for discovery.** Bonjour does not cross routers.
   Clients on another subnet do not find the box by themselves; P-touch for
   Mac can connect by IP address instead (untested).

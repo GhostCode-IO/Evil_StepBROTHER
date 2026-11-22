@@ -58,8 +58,8 @@ journalctl -u ql810wc-proxyd -n 30 --no-pager
 | P-touch finds the printer but shows no roll | [SNMP checks](#snmp-checks) |
 | P-touch for Mac or iPrint&Label for iOS does not list the printer | [Bonjour checks](#bonjour-checks), [Firewall checks](#firewall-checks) |
 | iPrint&Label (iOS) shows a 1.4" label instead of the loaded roll | Use the app's **Check Media** ([client setup](client-setup.md#ios-brother-iprintlabel)) |
-| A job from PowerPoint or another Mac application prints nothing (macOS may show it as completed, or pause its queue), or stops the printer | [Printer errors](#the-printer-shows-an-error-or-nothing-prints): `qlctl status` shows `refused` and why; for DK-22251 set the driver's **Color** to **2-Color(Black/Red)** and its paper size to `2.4"` or `62 mm` ([client setup](client-setup.md#printing-from-powerpoint-on-dk-22251)) |
-| A label from a Mac application is cut short | Brother's **Basic → Length** is shorter than the page. A saved preset keeps the Length it was saved with: check the preset's Length ([client setup](client-setup.md#printing-from-powerpoint-on-dk-22251)) |
+| A job from PowerPoint or another Mac application prints nothing (macOS may show it as completed, or pause its queue), or stops the printer | [Printer errors](#the-printer-shows-an-error-or-nothing-prints): `qlctl status` shows `refused` and why; for DK-22251 set the driver's **Color** to **2-Color(Black/Red)** and its paper size to `2.4"` or `62 mm`, and check both in the print dialog before every print ([client setup](client-setup.md#printing-from-powerpoint-on-dk-22251)) |
+| A label from a Mac application is cut short | Brother's **Basic → Length** is shorter than the page. Check **Paper Size**, **Color** and **Length** in the print dialog before every print: on the tested Mac, Color and Length did not stay set between prints, even with a saved preset ([client setup](client-setup.md#printing-from-powerpoint-on-dk-22251)) |
 | `replace media` in `qlctl status` or the selftest | [Printer errors](#the-printer-shows-an-error-or-nothing-prints): clear it at the printer |
 
 ## setup.sh problems
