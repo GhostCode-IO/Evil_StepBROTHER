@@ -120,8 +120,9 @@ entry says whether it is verified).
     eye: black text, red text and a red line where the PDF had them.
   - `qlctl test-print --mono --force` on the box: refused the same way; qlctl
     printed the reason and exited with 3.
-  Not tested yet: a two-colour job on a single-colour roll, and printing
-  through a macOS print queue with the check on.
+  Not tested yet: a two-colour job on a single-colour roll, and a 2-Color
+  print through a macOS print queue (a Monochrome one from PowerPoint was
+  refused that evening, see the entry on label sizes below).
   - Later the same day, an iPrint&Label **Check Media** tap left nothing in
     `ql810wc-proxyd`'s journal: no connection with data reached TCP 9100
     (one with only NULs and set-up commands would have been logged as `no
@@ -160,6 +161,106 @@ entry says whether it is verified).
   Under the box's non-English locale the bootstrap printed its first
   timestamps in another calendar, and the first selftest failed T2 on a UUID
   reader mix-up; both were fixed before the release.
+- **2026-11-21, label sizes from Brother's driver for macOS, and the media
+  check:** more local renders with the driver's own filter (filter 4.0.3,
+  PPD 4.0.4), run as in the entry "Brother's driver for macOS on its own"
+  above, with the Mac queue's PPD and a `DEVICE_URI` of that queue's form
+  (`dnssd://…`). Nothing was sent to a printer.
+  - On such a network queue every job's `ESC i z` had n1 `0x8E` (media
+    type, width and length valid, printer recovery), or `0xCE` with
+    **Quality** "Give priority to print quality" or "High resolution". Read
+    from the filter's code, not rendered: on a USB queue it sends `0x00`
+    (or `0x40`), with no check flags, and reads the printer's status itself.
+  - The media fields come only from the job's `media` option, looked up in
+    the filter's paper table. Without that option the filter uses the PPD's
+    default paper, `DC03` (`1.1" x 3.5"`, 29 × 90 mm die-cut), whatever size
+    the page has; on a paper name it does not know it crashed, with no
+    output. Headers seen: `2.4"` `8E 0A 3E 00 57 04 00 00 00 00` (62 mm
+    continuous, 1111 lines), `1.1" x 3.5"` `8E 0B 1D 5A DF 03 00 00 00 00`,
+    `2.4" x 1.1"` `8E 0B 3E 1D 0F 01 00 00 00 00` and `1.1"`
+    `8E 0A 1D 00 57 04 00 00 00 00`. `7" Postage Label`, `8" Postage Label`
+    and `Binder 2" - Spine` ask for 62 mm continuous too, with more lines.
+    So do `2.4" x2`, `x3` and `x4` (rendered later, during the review of
+    the media check): a page two to four labels wide comes out as a job of
+    two to four pages, each asking for 62 mm continuous tape, 1111 lines.
+    Replayed through `ql810wc-proxyd` and the test suite's fake printer
+    with DK-22251, all three went through. A multi-page job repeats the
+    page header, with n9 `00` on page 1 and `01` after it. The driver
+    refuses no combination of size and colour.
+  - **Basic → Length and Margin.** The print dialog sends both (the queue's
+    last-used settings hold them, and the second PowerPoint job below
+    matches them). On continuous tape the label then has
+    trunc(300 × (Length − 2 × Margin) / 25.4 + 3) lines, whatever the paper
+    size: Length 69.1 mm and Margin 3 mm give 748 lines
+    (`8E 0A 3E 00 EC 02 00 00 00 00`, `ESC i K 09` for 2-Color or `08` for
+    Monochrome, `ESC i d 23 00`). With a Length shorter than the page, the
+    top 35 rows (3 mm) of the page are dropped and the rest is cut off at
+    the Length; with at least the page's length (100 mm for `2.4"`, 184 mm
+    for `7" Postage Label`, 210 mm for `8" Postage Label` and
+    `Binder 2" - Spine`), the whole page prints. The queue's last-used
+    Length, 69.1 mm, cut a 62 × 100 mm page at about 69 mm. The box cannot
+    see this: the job still asks for 62 mm continuous tape.
+  - **2-Color with Quality "High resolution":** `ESC i K 49` (two-colour,
+    cut at end, high resolution), `ESC i z CE 0A 3E 00 AF 08 00 00 00 00`
+    and 600-dpi lines. Brother's user's guide says that high resolution
+    cannot be used with two-colour printing, and lists a "Two-color media
+    high resolution printing error" [B6].
+  - The Mac's queue, read from the Mac's own CUPS with `ipptool`: its
+    `printer-error-policy` is `stop-printer`, and it tells macOS that it is
+    monochrome (`color-supported` false), because the PPD sets `ColorDevice`
+    to `False`. The PPD's defaults are `DC03` and Monochrome.
+  - **Paper names and units** (read later, during the review of the media
+    check). The PPD Brother ships names its sizes in millimetres (`62 mm`,
+    `29 mm x 90 mm`, `62 mm x 184 mm Postage Label`, `Binder 5 cm - Spine`
+    and so on) and keeps the inch names as an alternative. The PPD of the
+    Mac's queue had the inch names and the unit type `inch`, and Brother's
+    Basic panel shows Length and Margin in either unit; the queue's
+    last-used Length, 69.1 mm, matches the PPD's default of 69 mm after a
+    round trip through 2.72 in. So the names and units apparently follow the
+    Mac's measurement units when the printer was added (not tried on a Mac
+    set to metric units).
+  - **The owner's two PowerPoint prints** through that queue, DK-22251
+    loaded, both asked for 62 mm continuous tape in Monochrome. The first
+    (5149 bytes, the macOS entry above) reached the printer before the box
+    had its colour check. The second, sent that evening with the colour
+    check on, was refused as black-only, and none of it reached the printer.
+    Its bytes were not captured. Its 4179 bytes are exactly the size of a
+    blank page rendered locally with the dialog's last-used settings
+    (Monochrome, Length 69.1 mm, Margin 3 mm: 748 blank rows), so it most
+    likely held nothing in the part of the page the driver prints. So its
+    size suited the roll, its colour mode did not, and its Length most
+    likely would have cut the page at about 69 mm. Why its page would have
+    been blank is not known.
+  - **The media check** (`RAW_MEDIA_CHECK`, on by default), built from these
+    findings and research item 6 below. It mirrors Brother's rule: it
+    refuses a job whose `ESC i z` asks the printer to check a field that
+    the loaded roll does not match (type, width, and on a die-cut roll the
+    length within ±1 mm), and a two-colour job in high resolution on a
+    black/red roll. It decides at the colour check's point, the job's first
+    raster row, on the `ESC i z` in force there (the first page's), and
+    refuses the same way: nothing of the job reaches the printer, the
+    client gets a reset, and the job is recorded as `refused`. It lets
+    through whatever it cannot judge: no recent status, no roll or an
+    unknown roll, a printer fault, no `ESC i z` before the first row (for
+    the size rules), and fields the job does not flag (with an INFO line).
+    A status read earlier that shows no roll or a fault is read again before
+    the job is judged: closing the roll cover sends no status, so a roll just
+    loaded shows only at the next poll. Before either check refuses a job on
+    an earlier status frame, it asks the printer once more, and the reply
+    decides; when the checks
+    already asked during the verdict (answered or not), no such confirm read
+    follows, so a job never waits for two status requests. A status request
+    of the checks that the printer takes only in part now tears the held
+    job without sending it (before, the job was released right behind it).
+    The job line now shows the header's line count, the length of the print
+    and the n1 flags.
+  - **Not verified on the tested unit:** that it rejects a flagged size
+    mismatch at all, what it then reports and which of Brother's reset
+    steps clears it, whether it checks fields a job does not flag, the
+    die-cut length tolerance, and the high-resolution error. A live test is
+    pending: prints that should pass first, then one refusal by the media
+    check (a 2-Color job from PowerPoint at `1.1" x 3.5"`), all with the
+    check on.
 
 ## Research summary
 
@@ -207,23 +308,57 @@ What the design rests on, by topic. Each item names its sources (keys in
    roll it cannot tell goes through unchecked. The documentation insists on
    two-colour mode for DK-22251, and `qlctl test-print` refuses the
    mismatch. The proxy itself never alters jobs.
+6. **The printer checks a job's media against the loaded roll, as far as
+   the job asks.** A job's `ESC i z` names the media it is for (type `0x0A`
+   continuous or `0x0B` die-cut, width and length in mm) and flags in n1
+   which of them are valid (`0x02`, `0x04`, `0x08`). When a flagged field
+   does not match the loaded roll, the printer reports error information 2
+   bit 0, "replace media" [B1]. Brother's user's guide calls it an
+   "Incorrect media error", says that high resolution cannot be used with
+   two-colour printing ("Two-color media high resolution printing error"),
+   and resets an error in this order: open and close the roll cover, then
+   press the Cutter button, then switch the printer off and on [B6]. After
+   such a mismatch a QL-800 ignored status requests and `ESC @` until its
+   roll cover was opened and closed [P4]; a QL-810W on Wi-Fi kept every
+   later job until its cover was cycled or it was switched off and on, and
+   then printed them [P2]. The flags clients send: P-touch Editor for Mac
+   `0x86` (type and width; seen in a packet capture of the session that
+   [ptouch-mac-session.md](ptouch-mac-session.md) describes; the capture
+   itself stays outside the repository), Brother's driver for macOS on a
+   network queue `0x8E` (local renders), Brother's Windows driver `0x86`
+   for continuous tape and `0x8E` for die-cut labels [P4], brother_ql
+   `0xCE` [O1], and `qlctl test-print` `0x86`. None of the media rules is
+   tested on the tested unit.
+   → `ql810wc-proxyd` refuses such a job before its print data reaches the
+   printer (`RAW_MEDIA_CHECK`, on by default), with the colour check's hold
+   and refusal: only the fields the job flags, only on a roll it knows,
+   never while the printer reports a fault (it holds jobs then [P2], and
+   presumably checks the roll it has when it resumes), the die-cut length
+   within ±1 mm (byte 17 is rounded) and no length on continuous tape. It
+   also refuses a two-colour job in high resolution on a black/red roll. A
+   status read earlier that shows no roll or a fault is read again before
+   the job is judged: closing the roll cover sends no status, so a roll just
+   loaded shows only at the next poll. Before either check refuses a job on an earlier status frame, it
+   asks the printer once more; a job never waits for two status requests.
+   What the header does not show (a label cut short by the driver's Length,
+   the layout, a blank page) it cannot catch.
 
 ### Status block
 
-6. **The SNMP status OID returns the same 32 bytes as the USB `ESC i S`
+7. **The SNMP status OID returns the same 32 bytes as the USB `ESC i S`
    reply.** Brother documents `1.3.6.1.4.1.2435.3.3.9.1.6.1.0` for the
    QL-810W [B2]; a real QL-810W (firmware 1.22) answers it [P1]; the tested
    unit's USB frame for DK-22251 equals that published SNMP frame byte for
    byte.
    → Serve the live USB frame verbatim.
-7. **Real printers differ from the manual** [B1 vs P1, P3, P4, tested
+8. **Real printers differ from the manual** [B1 vs P1, P3, P4, tested
    unit]: byte 11 is `0x0A`/`0x0B` (the manual says `0x4A`/`0x4B`), byte 14
    is a per-roll code, byte 6 reads `0x04` (meaning unknown; not a cover
    flag), and byte 25 is `0x81` only for the black/red roll, the one place
    where two-colour media shows up.
    → Never normalise status bytes: P-touch requires exactly `0x0A`/`0x0B` and
    `0x81`.
-8. **The reply to `ESC i S` is not always status type `0x00`.** With the
+9. **The reply to `ESC i S` is not always status type `0x00`.** With the
    cover open it is `0x02` (error occurred); a removed roll reads width 0 and
    type 0 without the "no media" bit, while byte 25 keeps the removed roll's
    value (tested unit only).
@@ -233,50 +368,50 @@ What the design rests on, by topic. Each item names its sources (keys in
 
 ### P-touch Editor for Mac
 
-9. **Its whole network contract** [L1], confirmed by observation on the
-   tested unit where marked:
-   - discovery through Bonjour `_pdl-datastream._tcp` only, accepting a
-     service only if TXT `usb_MDL` is exactly `QL-810W` and TXT `UUID` exists;
-     the saved printer's model is derived again from the instance name
-     `Brother QL-810W [...]` (observed: P-touch resolved
-     `Brother QL-810W [<host>]` and sent no SNMP discovery);
-   - printing to TCP port 9100 of the resolved host name, hard-coded
-     (observed: yes);
-   - SNMPv1 with the community `internal`; the string `public` does not exist
-     in its SDK (observed: all 13 requests used `internal`);
-   - one variable per request, 2 s per try, retries for up to 60 s; an
-     error-status such as noSuchName fails at once; only INTEGER and OCTET
-     STRING replies are accepted;
-   - status and media only from the status OID; during a job, 3 requests then
-     a 1 s pause, at most 180 rounds (observed: bursts of 3 each second);
-   - roll matching on bytes 10 (width), 17 (length) and 11 (type), plus byte
-     25 = `0x81` for the black/red paper;
-   - "Connect to printer with an IP address" reads only the IEEE-1284 OID
-     `1.3.6.1.4.1.2435.2.3.9.1.1.7.0` and needs `MDL:QL-810W` with no space.
+10. **Its whole network contract** [L1], confirmed by observation on the
+    tested unit where marked:
+    - discovery through Bonjour `_pdl-datastream._tcp` only, accepting a
+      service only if TXT `usb_MDL` is exactly `QL-810W` and TXT `UUID` exists;
+      the saved printer's model is derived again from the instance name
+      `Brother QL-810W [...]` (observed: P-touch resolved
+      `Brother QL-810W [<host>]` and sent no SNMP discovery);
+    - printing to TCP port 9100 of the resolved host name, hard-coded
+      (observed: yes);
+    - SNMPv1 with the community `internal`; the string `public` does not exist
+      in its SDK (observed: all 13 requests used `internal`);
+    - one variable per request, 2 s per try, retries for up to 60 s; an
+      error-status such as noSuchName fails at once; only INTEGER and OCTET
+      STRING replies are accepted;
+    - status and media only from the status OID; during a job, 3 requests then
+      a 1 s pause, at most 180 rounds (observed: bursts of 3 each second);
+    - roll matching on bytes 10 (width), 17 (length) and 11 (type), plus byte
+      25 = `0x81` for the black/red paper;
+    - "Connect to printer with an IP address" reads only the IEEE-1284 OID
+      `1.3.6.1.4.1.2435.2.3.9.1.1.7.0` and needs `MDL:QL-810W` with no space.
 
-   → An Avahi record with exactly those TXT keys; the communities `public` and
-   `internal`; a status OID that the persona answers in every situation (a
-   "turned off" block when the printer is unavailable, a synthesised printing
-   phase while a job is in flight); the persona says `QL-810W` everywhere.
-   One gap is snmpd's, not the persona's: while snmpd runs and the subagent is
-   not registered (an agent restart, about 1 s, or a crash), snmpd answers
-   noSuchName, so new settings reach the agent by reload in its running
-   AgentX session, and a restart is kept for new code. After an snmpd restart
-   requests are dropped until the agent registers again, and P-touch retries.
-10. **P-touch 5.3 does not print through macOS print queues** [L1]; an older
+    → An Avahi record with exactly those TXT keys; the communities `public` and
+    `internal`; a status OID that the persona answers in every situation (a
+    "turned off" block when the printer is unavailable, a synthesised printing
+    phase while a job is in flight); the persona says `QL-810W` everywhere.
+    One gap is snmpd's, not the persona's: while snmpd runs and the subagent is
+    not registered (an agent restart, about 1 s, or a crash), snmpd answers
+    noSuchName, so new settings reach the agent by reload in its running
+    AgentX session, and a restart is kept for new code. After an snmpd restart
+    requests are dropped until the agent registers again, and P-touch retries.
+11. **P-touch 5.3 does not print through macOS print queues** [L1]; an older
     Brother FAQ describes adding a macOS CUPS queue instead [B5]. The observed
     session needed none.
     → The P-touch for Mac setup has no queue step.
 
 ### Identity
 
-11. **The "c" variant reports the base model.** The tested QL-810Wc
+12. **The "c" variant reports the base model.** The tested QL-810Wc
     reports USB ID `04f9:209c`, product "QL-810W" and `MDL:QL-810W` (tested
     unit); Brother describes it as a derivative of the QL-810W with no
     protocol change [B3]; the QL-820NWBc behaves the same way [P3]; the Mac
     SDK has no "QL-810Wc" model at all [L1].
     → Present the box as `QL-810W`, never `QL-810Wc`.
-12. **Identity strings of a real networked QL-810W are known only from third
+13. **Identity strings of a real networked QL-810W are known only from third
     parties:** `sysDescr` names the NC-36002w network module [P2], and
     Brother's network printers use `sysObjectID` `1.3.6.1.4.1.2435.2.3.9.1`
     (seen on Brother lasers [O8]; unverified on a QL). PEN 2435 is Brother
@@ -286,7 +421,7 @@ What the design rests on, by topic. Each item names its sources (keys in
 
 ### SNMP agent
 
-13. **Other clients read standard objects at index 1** (system group,
+14. **Other clients read standard objects at index 1** (system group,
     `ifPhysAddress.1`, `hrDeviceDescr.1`, `hrPrinterStatus.1`, Printer-MIB):
     Brother's Windows driver installer sends one SNMPv1 broadcast request with
     five variables [P5], and in SNMPv1 one unknown variable fails the whole
@@ -296,7 +431,7 @@ What the design rests on, by topic. Each item names its sources (keys in
     → An SNMP context `printer` holding only the persona, served by our own
     AgentX subagent [S1]; the host's MIBs stay in the default context for
     SNMPv3.
-14. **net-snmp mechanics** [O5, F3]: `com2sec -Cn` maps a community and
+15. **net-snmp mechanics** [O5, F3]: `com2sec -Cn` maps a community and
     source to a context, and the first matching line wins; USM users cannot be
     limited by source; a context is silently dropped until a subagent has
     registered in it; `pass_persist` children have no read timeout and serve
@@ -310,7 +445,7 @@ What the design rests on, by topic. Each item names its sources (keys in
 
 ### Fedora 44 platform
 
-15. **USB contention.** ipp-usb, a weak dependency of Fedora's cups package
+16. **USB contention.** ipp-usb, a weak dependency of Fedora's cups package
     [F4], claims printer-class protocol-4 (IPP-over-USB) interfaces [O4]; on
     the QL-810Wc that is alternate setting 1 of the raster interface, so an
     ipp-usb claim unbinds usblp (tested unit). CUPS 2.4's libusb backend
@@ -321,7 +456,7 @@ What the design rests on, by topic. Each item names its sources (keys in
     → `ql810wc-proxyd` is the only USB owner; an ipp-usb quirk and a CUPS
     usb-quirks entry keep the others away; the local CUPS queue prints to the
     proxy over `socket://127.0.0.1:9100`.
-16. **SELinux and firewall.** Programs systemd starts from `bin_t` or `usr_t`
+17. **SELinux and firewall.** Programs systemd starts from `bin_t` or `usr_t`
     run as `unconfined_service_t`, while `snmpd_t` children may not open USB
     devices or read generic `/run` files [F1]. Fedora Server's default zone
     allows only ssh, dhcpv6-client and cockpit, so mDNS is closed [F2], and
@@ -329,10 +464,10 @@ What the design rests on, by topic. Each item names its sources (keys in
     → No custom policy module (one file-context rule in `pass_persist` mode);
     rules applied at runtime and permanently without reload; UDP 5353 opened
     per source range, never zone-wide.
-17. **Bonjour.** The TXT keys mirror Apple's printing specification and real
+18. **Bonjour.** The TXT keys mirror Apple's printing specification and real
     Brother printers [S4, P6]; Avahi publishes static service files [O6], and
     browsing clients need inbound UDP 5353.
-18. **Validation tool.** brother_ql_next 0.12.0 (GPL-3.0) supports the
+19. **Validation tool.** brother_ql_next 0.12.0 (GPL-3.0) supports the
     QL-810W and two-colour labels [O2] and printed on the tested unit; the
     original brother_ql 0.9.4 on PyPI fails with current Pillow [O1].
     → Optional, installed from PyPI into a separate venv, never vendored and
@@ -361,6 +496,12 @@ What the design rests on, by topic. Each item names its sources (keys in
   colour check).
 - Whether the colour-mismatch error code sits in byte 7 or byte 31 on the
   QL-810W(c) (the Mac SDK reads byte 7; a QL-800 used byte 31) [L1, P4].
+- The media rules on the QL-810Wc (research item 6): whether it rejects a
+  flagged size mismatch, what it reports then and which of Brother's reset
+  steps clears it, whether it checks fields a job does not flag, its
+  die-cut length tolerance, and how it reports a two-colour job in high
+  resolution. Also which flags iPrint&Label sends in its `ESC i z` (the job
+  line shows them now).
 
 ## Sources
 
@@ -377,6 +518,11 @@ Brother:
   <https://support.brother.com/g/b/faqend.aspx?c=us&lang=en&prod=lpql810weus&faqid=faqp00100383_000>
 - **[B5]** Brother FAQ faqp00001674_001 (QL-810W, printing from macOS).
   <https://support.brother.com/g/b/faqend.aspx?c=us&lang=en&prod=lpql810weus&faqid=faqp00001674_001>
+- **[B6]** Brother, *User's Guide QL-810W/QL-820NWB*, version 06: two-colour
+  printing (p.103), the LED indications with "Incorrect media error" and
+  "Two-color media high resolution printing error", and resetting an error
+  (p.182).
+  <https://download.brother.com/welcome/docp100287/ql810w_ql820nwb_use_ug_06.pdf>
 
 Published hardware observations and prior art (read, not copied):
 

@@ -105,7 +105,7 @@ enforcing, net-snmp 5.9.5.2) with a QL-810Wc on USB.
 |---|---|---|---|
 | P-touch Editor 5.3 for Mac | verified with 5.3.23 (Bonjour) | verified: DK-22251 shown as 62 mm black/red | verified: black and black/red labels, checked by eye |
 | Brother iPrint&Label for iOS | verified (2026-11-21) | verified (2026-11-21), after the app's **Check Media** | verified (2026-11-21) |
-| Other Mac apps (for example PowerPoint) with Brother's QL-810W driver for macOS | verified (2026-11-21): macOS adds the box from Bonjour | not applicable: you choose the label size | partly verified (2026-11-21): the driver's black/red output, sent from a Mac straight to TCP 9100, printed correctly (checked by eye); its monochrome output is refused. Not yet through a macOS print queue |
+| Other Mac apps (for example PowerPoint) with Brother's QL-810W driver for macOS | verified (2026-11-21): macOS adds the box from Bonjour | not applicable: you choose the label size, and the box refuses one that does not suit the loaded roll | partly verified (2026-11-21): the driver's black/red output, sent from a Mac straight to TCP 9100, printed correctly (checked by eye); its monochrome output is refused, also from PowerPoint through a macOS print queue. A black/red print through a macOS print queue is not tested yet |
 | P-touch Editor for Windows with Brother's QL-810W(c) driver | untested | untested | untested |
 | BRAdmin | untested | untested | not applicable |
 | Android apps (iPrint&Label and others) | untested | untested | untested |
@@ -139,8 +139,12 @@ Also verified on the tested unit:
   (`RAW_COLOR_CHECK`), a job from PowerPoint reached the printer. It was
   monochrome, the driver's default, so with DK-22251 loaded the printer
   rejected it and stopped answering until it was switched off and on (see
-  the [media rules](docs/client-setup.md#media-rules)). For this roll, set
-  the driver's **Color** option to **2-Color(Black/Red)**.
+  the [media rules](docs/client-setup.md#media-rules)). A second monochrome
+  job from PowerPoint, sent once the box had the colour check, was refused,
+  and none of it reached the printer. For this roll, set the driver's
+  **Color** option to **2-Color(Black/Red)** and its paper size to `2.4"`
+  (`62 mm` when the driver names sizes in millimetres;
+  [client setup](docs/client-setup.md#macos-other-applications-brothers-driver)).
 - The colour check, with DK-22251 loaded: a label rendered by Brother's
   QL-810W driver for macOS (its own filter, run by hand on a Mac) was sent
   from the Mac to TCP 9100. The Monochrome version was refused: the Mac's
@@ -173,6 +177,14 @@ Also verified on the tested unit:
 - A black/red label printed from another Mac application through a macOS
   print queue with Brother's QL-810W driver (**Color** set to
   **2-Color(Black/Red)**). The driver's own output, sent to TCP 9100, printed.
+- The rules of the media check (`RAW_MEDIA_CHECK`) on the tested unit.
+  Brother documents that the printer rejects a job for other media than the
+  loaded roll, and a two-colour job in high resolution. Owners of the QL-800
+  and QL-810W report that after a media mismatch ("replace media") the
+  printer stops until someone clears it at the printer. No job has been
+  refused by the media check on the tested unit yet; that live test is
+  pending. It refuses a job the same way as the colour check, whose rule
+  and refusals are verified there.
 - The plain QL-810W (firmware 1.x). It reports the same USB ID and protocol,
   so it is expected to work.
 - Die-cut DK-11201 labels printed from P-touch, and P-touch noticing a roll
@@ -511,8 +523,9 @@ as well: `sudo rm -rf /usr/local/src/ql810wc-print-proxy`.
 - The QL-810Wc speaks Brother raster, and two-colour data travels inside that
   stream. `ql810wc-proxyd` is the only process that opens the printer. It
   writes each job to USB unchanged and never re-renders it or synthesizes red;
-  a job whose colour mode the loaded roll cannot print is refused instead,
-  before any of its print data reaches the printer (`RAW_COLOR_CHECK`).
+  a job whose colour mode or media the loaded roll cannot take is refused
+  instead, before any of its print data reaches the printer
+  (`RAW_COLOR_CHECK`, `RAW_MEDIA_CHECK`).
 - What P-touch needs besides the data is on SNMP: above all the printer's
   32-byte status block, which carries the loaded roll.
   `ql810wc-snmp-agent` serves it live, together with the rest of the persona
@@ -705,6 +718,9 @@ TIER REACHED: T3
   `host.reach` (`SNMP_V3_ALLOWED_CIDRS` holds only documentation ranges), and
   `t2.agent.canreload` / `t2.agent.reload` (the agent's unit file is outdated,
   or the agent rejected its last reload).
+- Two more warnings name a check of `ql810wc-proxyd` that `config.env`
+  switches off: `t0.mediacheck` (`RAW_MEDIA_CHECK`) and `t1.colorcheck`
+  (`RAW_COLOR_CHECK`; an `INFO` line unless DK-22251 is loaded).
 
 Problems the report points to are explained in
 [docs/troubleshooting.md](docs/troubleshooting.md#reading-the-selftest-report).
@@ -717,7 +733,7 @@ Problems the report points to are explained in
 | Command | What it does |
 |---|---|
 | `status [--json [--show-serial]]` | What `ql810wc-proxyd` last saw: printer state, loaded roll, errors, last job. |
-| `test-print [--two-color \| --mono] [--pattern bars\|black] [--width MM]` | Prints a test label through TCP 9100 (default: two-colour bars on 62 mm). Refuses a job that does not suit the loaded roll, for example `--mono` on DK-22251 or any job on die-cut labels, and a `--width` other than the loaded roll's: the job's `ESC i z` would make the printer report "replace media". `--force` sends it anyway; with `RAW_COLOR_CHECK` on, `ql810wc-proxyd` still refuses a label whose colour mode the loaded roll cannot print (`--mono` on DK-22251, a two-colour label on a single-colour roll), and qlctl says so and exits with 3. |
+| `test-print [--two-color \| --mono] [--pattern bars\|black] [--width MM]` | Prints a test label through TCP 9100 (default: two-colour bars on 62 mm). Refuses a job that does not suit the loaded roll, for example `--mono` on DK-22251 or any job on die-cut labels, and a `--width` other than the loaded roll's: the job's `ESC i z` would make the printer report "replace media". `--force` sends it anyway, but `ql810wc-proxyd` still refuses a label the loaded roll cannot take: with `RAW_COLOR_CHECK` on, a colour mode the roll cannot print (`--mono` on DK-22251, a two-colour label on a single-colour roll); with `RAW_MEDIA_CHECK` on, another `--width` than the roll's, or any test label on die-cut labels. qlctl then says why and exits with 3. |
 | `probe [--json [--show-serial]]` | Reads the status straight from USB (needs root). Refused while `ql810wc-proxyd` runs. |
 | `version` | Prints the version. |
 
@@ -759,7 +775,8 @@ serial are detected at runtime.
 | `STATUS_POLL_SECONDS` | `3` | Seconds between status polls of an idle printer (1 to 60). The printer is never polled while a job prints. The persona's staleness limit follows it (see below the table). |
 | `RAW_IDLE_TIMEOUT` | `300` | Seconds a connected client may send nothing before the proxy closes the connection (10 to 86400). An unfinished job is then cancelled and the printer resynchronised; after a finished job it is an ordinary close (P-touch for Mac keeps the connection open for a while after a job). |
 | `MAX_JOB_BYTES` | `16777216` | Largest job accepted on one connection, in bytes (65536 to 1073741824). A larger job is cancelled and the printer resynchronised. 16 MiB holds an uncompressed two-colour label 1 m long. |
-| `RAW_COLOR_CHECK` | `yes` | Refuse a job whose colour mode the loaded roll cannot print: a black-only job while DK-22251 is loaded, or a black/red job on a single-colour roll. The printer rejects such a job itself, and after a black-only job on DK-22251 the tested unit needed a power cycle. None of a refused job's print data reaches the printer: the client's connection is reset (macOS may still show the job as completed), and `qlctl status` shows the job as `refused`, with the reason. A job whose colour mode or roll is not certain goes through. `no`: forward every job unchecked. |
+| `RAW_COLOR_CHECK` | `yes` | Refuse a job whose colour mode the loaded roll cannot print: a black-only job while DK-22251 is loaded, or a black/red job on a single-colour roll. The printer rejects such a job itself, and after a black-only job on DK-22251 the tested unit needed a power cycle. None of a refused job's print data reaches the printer: the client's connection is reset (macOS may still show the job as completed), and `qlctl status` shows the job as `refused`, with the reason. A job whose colour mode or roll is not certain goes through. `no`: forward such jobs. |
+| `RAW_MEDIA_CHECK` | `yes` | Refuse a job that asks for other media than the loaded roll (a media type, continuous or die-cut, width or die-cut label length that the job asks the printer to check and the roll does not match, such as a job for 29 × 90 mm die-cut labels while DK-22251 is loaded), and a two-colour job in high resolution on DK-22251. Brother documents that the printer rejects both, and owners of the QL-800 and QL-810W report that after a media mismatch it stops until someone clears it at the printer (not seen on the tested unit yet). A refused job is handled as with `RAW_COLOR_CHECK`. A job whose media or roll is not certain (no recent status, no roll, a printer fault) goes through. `no`: forward such jobs. |
 | `CUPS_QUEUE` | `QL810Wc-proxy` | Raw CUPS queue for applications on the box. Its device is the proxy (`socket://127.0.0.1:RAW_PORT`), so CUPS never opens the USB printer. Empty: no queue. An existing queue of that name that the installer did not create is left alone. |
 | `CUPS_QUEUE_SHARED` | `no` | Share that queue over CUPS/IPP. Keep `no`: a shared raw queue attracts PDF jobs the QL cannot print. |
 | `USB_VENDOR_ID` | `04f9` | Brother's USB vendor ID. |
@@ -796,10 +813,16 @@ One daemon setting is derived rather than set: the installer writes
 is more, into `runtime.env`; it is no `config.env` setting. An idle status
 older than that counts as stale, and the persona then reports the printer as
 switched off. That is why every `STATUS_POLL_SECONDS` from 1 to 60 works.
-The colour check (`RAW_COLOR_CHECK`) asks the printer for a new status when
-the last one is older than `STATUS_MAX_AGE_SECONDS` (not while the printer's
-input state is unknown, for example after a torn job), and lets the job
-through unchecked if none comes.
+The checks of `ql810wc-proxyd` (`RAW_COLOR_CHECK`, `RAW_MEDIA_CHECK`) ask
+the printer for a new status when the last one is older than
+`STATUS_MAX_AGE_SECONDS`, and let the job through unchecked if none comes.
+A status read earlier that shows no roll or a fault is read again before the
+job is judged: closing the roll cover sends no status, so a roll just loaded
+shows only at the next poll.
+Before they refuse a job on a status read earlier, they ask the printer once
+more, so a roll swapped since then is seen. A job waits for one such status
+request at most, and none goes out while the printer's input state is
+unknown (for example after a torn job).
 Every daemon setting is described in `agent/ql810wc/config.py`.
 
 ## Security model
@@ -869,6 +892,20 @@ Details: [docs/security.md](docs/security.md).
   otherwise: while this roll is loaded, set **Color** to
   **2-Color(Black/Red)** (macOS) or turn on 2-Color (Windows). See
   [client setup](docs/client-setup.md#media-rules).
+- **A job must ask for the loaded roll.** Each job names the media it was
+  made for (its `ESC i z`: continuous or die-cut, width, label length) and
+  which of them the printer is to check. Brother documents that the printer
+  rejects a job whose checked media does not match the loaded roll ("replace
+  media"), and a two-colour job in high resolution. Owners of the QL-800 and
+  QL-810W report that after "replace media" the printer stops until someone
+  clears it at the printer. So `ql810wc-proxyd` refuses such a job too,
+  before its print data reaches the printer (`RAW_MEDIA_CHECK`). An example
+  is a job at the default paper size of Brother's driver for macOS,
+  `1.1" x 3.5"` (29 × 90 mm die-cut labels), while DK-22251 is loaded. This
+  rule is not yet tested on the tested unit. The box sees only what the job
+  asks for: on continuous tape a label that is cut too short, a layout that
+  does not fit and a blank label all go through. See
+  [client setup](docs/client-setup.md#media-rules).
 - **One network segment for discovery.** Bonjour does not cross routers.
   Clients on another subnet do not find the box by themselves; P-touch for
   Mac can connect by IP address instead (untested).
@@ -888,8 +925,8 @@ Details: [docs/security.md](docs/security.md).
 Start with `sudo ./selftest.sh` in the checkout.
 [docs/troubleshooting.md](docs/troubleshooting.md) explains its report and
 covers setup.sh's messages, Editor Lite, ipp-usb, CUPS's usb backend,
-"printer switched off", high CPU, SNMP, Bonjour, firewall, logs, SELinux, and
-uninstall/reinstall.
+"printer switched off", refused jobs and printer errors, high CPU, SNMP,
+Bonjour, firewall, logs, SELinux, and uninstall/reinstall.
 
 ## Repository layout
 

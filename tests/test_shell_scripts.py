@@ -418,10 +418,18 @@ class RuntimeKeysStaticTest(unittest.TestCase):
         self.assertIn("RAW_IDLE_TIMEOUT", keys)
         self.assertIn("MAX_JOB_BYTES", keys)
         self.assertIn("RAW_COLOR_CHECK", keys)
+        self.assertIn("RAW_MEDIA_CHECK", keys)
 
     def test_template_turns_the_color_check_on(self):
         text = (REPO / "config.sample.env").read_text(encoding="utf-8")
         self.assertRegex(text, r'(?m)^RAW_COLOR_CHECK="yes"$')
+
+    def test_template_turns_the_media_check_on(self):
+        text = (REPO / "config.sample.env").read_text(encoding="utf-8")
+        self.assertRegex(text, r'(?m)^RAW_MEDIA_CHECK="yes"$')
+        keys = re.findall(r"(?m)^([A-Z][A-Z0-9_]*)=", text)
+        self.assertEqual(keys[keys.index("RAW_COLOR_CHECK") + 1], "RAW_MEDIA_CHECK",
+                         "the media check follows the colour check (the README's table keeps this order)")
 
 
 class RuntimeSettingsTest(ShellTestCase):
@@ -459,9 +467,11 @@ qlp_sync_runtime_env
         values = self.written()
         self.assertEqual((values["RAW_IDLE_TIMEOUT"], values["MAX_JOB_BYTES"]), ("300", "16777216"))
         self.assertEqual(values["RAW_COLOR_CHECK"], "yes", "the colour check is on unless switched off")
+        self.assertEqual(values["RAW_MEDIA_CHECK"], "yes", "the media check is on unless switched off")
         settings = self.daemon_settings()
         self.assertEqual((settings.raw_idle_timeout, settings.max_job_bytes), (300.0, 16 * 1024 * 1024))
         self.assertTrue(settings.color_check)
+        self.assertTrue(settings.media_check)
 
     def test_the_color_check_can_be_switched_off(self):
         for value, written, on in (("off", "no", False), ("No", "no", False), ("TRUE", "yes", True)):
@@ -470,9 +480,23 @@ qlp_sync_runtime_env
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertEqual(self.written()["RAW_COLOR_CHECK"], written)
                 self.assertIs(self.daemon_settings().color_check, on)
+                self.assertTrue(self.daemon_settings().media_check, "each check has a setting of its own")
         done = self.sync(RAW_COLOR_CHECK="sometimes")
         self.assertEqual(done.returncode, 1)
         self.assertIn("RAW_COLOR_CHECK='sometimes' is not a yes/no value", done.stderr)
+        self.assertFalse(self.runtime.exists())
+
+    def test_the_media_check_can_be_switched_off(self):
+        for value, written, on in (("off", "no", False), ("0", "no", False), ("", "no", False), ("Yes", "yes", True)):
+            with self.subTest(value=value):
+                done = self.sync(RAW_MEDIA_CHECK=value)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(self.written()["RAW_MEDIA_CHECK"], written)
+                self.assertIs(self.daemon_settings().media_check, on)
+                self.assertTrue(self.daemon_settings().color_check, "each check has a setting of its own")
+        done = self.sync(RAW_MEDIA_CHECK="sometimes")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("RAW_MEDIA_CHECK='sometimes' is not a yes/no value", done.stderr)
         self.assertFalse(self.runtime.exists())
 
     def test_values_are_written_canonically(self):

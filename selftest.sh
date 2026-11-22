@@ -1163,8 +1163,14 @@ printer_error_hint() { # errors
     *"cover open"*)               printf 'close the printer cover' ;;
     *"no media"*|*"end of media"*) printf 'load a DK roll' ;;
     *"cutter jam"*)                printf 'clear the cutter jam' ;;
-    *"replace media"*|*"does not support"*|*"unsupported media"*)
-      printf 'the last job did not match the loaded roll; switch the printer off and on' ;;
+    # The colour codes before "replace media", which may come with them (case takes the first
+    # match): a power cycle is what cleared a black-only job on DK-22251 on the tested unit.
+    *"does not support"*)
+      printf '%s' "the last job's colour mode did not suit the loaded roll; switch the printer off and on" ;;
+    # Brother's reset order for a job that does not match the loaded roll.
+    *"replace media"*|*"unsupported media"*)
+      printf '%s' "the last job did not match the loaded roll: open and close the roll cover; if the error" \
+                  " stays, press the Cutter button; if it still stays, switch the printer off and on" ;;
     *)                             printf 'fix it at the printer, then re-run this test' ;;
   esac
 }
@@ -1424,6 +1430,16 @@ firewall_t0() {
   fi
 }
 
+# ql810wc-proxyd's media check, as runtime.env sets it (the daemon's default is on). It guards
+# every job, not only two-colour ones, so T0 reports it. "may": owners of the QL-800 and QL-810W
+# report the stop after a media mismatch; it was not tried on the tested unit.
+media_check_posture() {
+  if [[ -n "${RT[RAW_MEDIA_CHECK]+set}" ]] && ! qlp_is_yes "${RT[RAW_MEDIA_CHECK]}"; then
+    check t0 warn t0.mediacheck "RAW_MEDIA_CHECK is off: a job for other media than the loaded roll reaches the" \
+                                "printer, which may then stop until someone clears it at the printer"
+  fi
+}
+
 section_data_plane() {
   local socket_up=0 service_up=0
   section "T0/T1 data plane: TCP $PORT -> ql810wc-proxyd -> USB printer"
@@ -1436,6 +1452,7 @@ section_data_plane() {
   else
     check t0 fail t0.state "${ST[problem]:-no state from ql810wc-proxyd}"
   fi
+  media_check_posture
   if ((service_up)); then process_checks; fi
   usb_exclusion_checks
   cups_queue_check
@@ -1539,8 +1556,8 @@ section_two_color() {
   if [[ -n "${RT[RAW_COLOR_CHECK]+set}" ]] && ! qlp_is_yes "${RT[RAW_COLOR_CHECK]}"; then
     local lvl=info
     if [[ "${ST[media_two_color]:-0}" == 1 ]]; then lvl=warn; fi
-    check t1 "$lvl" t1.colorcheck "RAW_COLOR_CHECK is off: every job goes to the printer unchecked, and after a" \
-                                  "black-only job on DK-22251 the printer needs a power cycle"
+    check t1 "$lvl" t1.colorcheck "RAW_COLOR_CHECK is off: a black-only job reaches the printer, and after one on" \
+                                  "DK-22251 the printer needs a power cycle"
   fi
   if [[ "${ST[job_two_color]:-}" == 1 && "${ST[job_last_result]:-}" == ok ]]; then
     check t1 info t1.lastjob "the last job was two-colour and the printer reported it done (${ST[job_last_ago]:-?} ago)"

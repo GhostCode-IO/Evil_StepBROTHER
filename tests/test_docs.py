@@ -18,6 +18,8 @@ repository's files:
 * report lines quoted from selftest.sh (PASS/WARN/FAIL/SKIP/INFO lines, the
   verdict's summary lines, DEGRADED, NOTE: and TIER REACHED lines) still
   exist in it, with the same status;
+* the reasons for a refused job that the docs quote are ones ql810wc-proxyd
+  gives, and the journal lines around them are its own;
 * the README's configuration table lists config.sample.env's keys, in the
   template's order and with its defaults;
 * relative links and their #anchors resolve, repository paths quoted as
@@ -27,18 +29,22 @@ repository's files:
 * the user documentation cites no commit hash: a hash tells a reader
   nothing, and it dangles once history is rewritten.
 
-Standard library only. Nothing here runs a script.
+Standard library only, plus the agent's own ql810wc package for
+ql810wc-proxyd's texts. Nothing here runs a script.
 """
 from __future__ import annotations
 
 import pathlib
 import re
+import sys
 import unittest
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from tests._util import REPO
 
 README = REPO / "README.md"
+AGENT_DIR = REPO / "agent"
+PROXYD = AGENT_DIR / "ql810wc" / "proxyd.py"
 USER_DOCS: Tuple[pathlib.Path, ...] = (README, *sorted((REPO / "docs").glob("*.md")))
 DOCS: Tuple[pathlib.Path, ...] = (*USER_DOCS, *sorted((REPO / "dev" / "notes").glob("*.md")))
 SCRIPTS: Dict[str, pathlib.Path] = {name: REPO / f"{name}.sh"
@@ -333,6 +339,22 @@ def contains_in_order(line: str, fragments: List[str]) -> bool:
     return True
 
 
+def log_format(path: pathlib.Path, start: str) -> str:
+    """The format string of the log call in the Python file PATH whose
+    message starts with START, adjacent string literals joined."""
+    text = re.sub(r'"[ \t]*\n[ \t]*"', "", read(path))
+    match = re.search(r'\blog\.\w+\(\s*"(%s[^"]*)"' % re.escape(start), text)
+    if match is None:
+        raise AssertionError(f"{path.name} logs no message that starts with {start!r}")
+    return match.group(1)
+
+
+def ellipsis_pattern(text: str) -> "re.Pattern[str]":
+    """TEXT as a pattern in which each "…" (and the blanks around it) stands
+    for any text."""
+    return re.compile(".*".join(re.escape(part) for part in re.split(r"\s*…\s*", text)))
+
+
 def template_settings() -> List[Tuple[str, str]]:
     """(key, default) of every setting in config.sample.env, in file order,
     read the way scripts/lib/common.sh's parser reads it."""
@@ -577,6 +599,134 @@ class QuotedReportTest(unittest.TestCase):
                             f"{where}: selftest.sh never reports {label} as {status!r}")
             if exact:
                 self.assertEqual(text, "%-18s %s" % (label, status), f"{where}: not the report's layout")
+
+
+class QuotedRefusalTest(unittest.TestCase):
+    """What the docs quote from ql810wc-proxyd about its checks
+    (RAW_COLOR_CHECK, RAW_MEDIA_CHECK) is what it writes. A code span with
+    ", but the loaded roll" in it is a reason for a refused job: it must
+    match ("…" standing for any text) a reason that proxyd's
+    _refusal_detail() gives for a roll of the media table and a job for one
+    of its papers, black-only, two-colour or not judged, in high resolution
+    or not. Quoted journal lines keep proxyd's own wording around it, with
+    any peer ("…", a placeholder such as <client>, or an address). The INFO
+    line for a job that goes to the printer unchecked may stand for any part
+    with "…", or give it in full."""
+
+    @classmethod
+    def setUpClass(cls):
+        if str(AGENT_DIR) not in sys.path:
+            sys.path.insert(0, str(AGENT_DIR))
+        from ql810wc import media, proxyd, rasterproto
+        checked = rasterproto.PI_RECOVER | rasterproto.PI_KIND | rasterproto.PI_WIDTH | rasterproto.PI_LENGTH
+        jobs: List[Optional[Dict[str, int]]] = [None]
+        jobs += [{"flags": checked, "type": paper.media_type, "width": paper.width_mm, "length": paper.length_mm}
+                 for paper in media.MEDIA]
+        reasons: Set[str] = set()
+        for roll in media.MEDIA:
+            frame = media.synthesize_status(roll)
+            for two in (None, False, True):
+                for requested in jobs:
+                    # High resolution is judged for a job that is not black only.
+                    for high_res in ((False,) if two is False else (False, True)):
+                        reason, _unchecked = proxyd._refusal_detail(frame, two, requested, high_res)
+                        if reason:
+                            reasons.add(reason)
+        cls.reasons = reasons
+        cls.refused = log_format(PROXYD, "refused a print job from")
+        cls.unchecked = log_format(PROXYD, "a job from %s for %s goes to the printer unchecked")
+
+    def check_refusal_quote(self, text: str, where: str) -> bool:
+        """Asserts that TEXT, a code span of the docs, is what proxyd writes
+        when it refuses a job: its journal line, with any peer, or the reason
+        on its own. Returns whether TEXT holds a reason to match."""
+        prefix, _, suffix = self.refused.partition("%s: %s")
+        if text.startswith(prefix):
+            peer = re.match(re.escape(prefix) + r"\S+: ", text)
+            self.assertIsNotNone(peer, f"{where} is not proxyd's {self.refused!r}")
+            text = text[peer.end():]
+            if "None of its" in text:
+                self.assertTrue(text.endswith(suffix), f"{where} is not proxyd's {self.refused!r}")
+                text = text[:-len(suffix)]
+        if ", but the loaded roll" not in text:
+            return False
+        pattern = ellipsis_pattern(text)
+        self.assertTrue(any(pattern.fullmatch(reason) for reason in self.reasons),
+                        f"{where} is no reason ql810wc-proxyd gives for a refused job")
+        return True
+
+    def check_unchecked_quote(self, text: str, where: str) -> None:
+        """Asserts that TEXT, a code span of the docs, is proxyd's INFO line
+        for a job that goes to the printer unchecked: "…" stands for any
+        text, and a value given in full may replace any of its %s."""
+        elided = self.unchecked.replace("%s", "…")
+        full = ".+".join(re.escape(part) for part in self.unchecked.split("%s"))
+        self.assertTrue(ellipsis_pattern(text).fullmatch(elided) or re.fullmatch(full, text),
+                        f"{where} is not proxyd's {self.unchecked!r}")
+
+    def test_generated_reasons(self):
+        """Guards the set the other test matches against."""
+        self.assertIn("a black-only job, but the loaded roll, 62mm continuous black/red (DK-22251), takes two-color "
+                      "jobs only", self.reasons)
+        self.assertIn("a job for 29x90 mm die-cut labels, but the loaded roll is 62mm continuous black/red "
+                      "(DK-22251)", self.reasons)
+        self.assertEqual(self.refused, "refused a print job from %s: %s. None of its print data was sent to "
+                                       "the printer")
+        self.assertEqual(self.unchecked, "a job from %s for %s goes to the printer unchecked: the loaded roll is "
+                                         "%s, but the job does not ask the printer to check its %s")
+
+    def test_quote_checks_take_what_proxyd_writes(self):
+        """Guards the two checks below: lines as proxyd writes them pass, with
+        "…" for any part or in full, and other wording fails."""
+        reason = "a job for 29x90 mm die-cut labels, but the loaded roll is 62mm continuous black/red (DK-22251)"
+        for peer in ("…", "<client>", "192.0.2.10:50002"):
+            line = f"refused a print job from {peer}: {reason}. None of its print data was sent to the printer"
+            self.assertTrue(self.check_refusal_quote(line, line))
+        self.assertTrue(self.check_refusal_quote(reason, reason))
+        self.assertTrue(self.check_refusal_quote("a job for …, but the loaded roll is …", "elided"))
+        self.assertFalse(self.check_refusal_quote("refused a print job from …: <reason>. None of its print data "
+                                                  "was sent to the printer", "placeholder reason"))
+        for wrong in (reason.replace("black/red", "red"),
+                      f"refused a print job from: {reason}",
+                      f"refused a print job from …: {reason}. None of its print data reached the printer"):
+            with self.assertRaises(AssertionError, msg=wrong):
+                self.check_refusal_quote(wrong, wrong)
+        for line in ("a job from 192.0.2.10:50002 for 29 mm continuous tape goes to the printer unchecked: the "
+                     "loaded roll is 62mm continuous black/red (DK-22251), but the job does not ask the printer to "
+                     "check its width",
+                     "a job from … for 29x90 mm die-cut labels goes to the printer unchecked: the loaded roll is "
+                     "62mm continuous black/red (DK-22251), but the job does not ask the printer to check its type "
+                     "or width",
+                     "a job from … for … goes to the printer unchecked: the loaded roll is …, but the job does not "
+                     "ask the printer to check its …",
+                     "a job from … for … goes to the printer unchecked: …"):
+            self.check_unchecked_quote(line, line)
+        for wrong in ("a job from … for … goes to the printer unchecked: the roll is …, but the job does not ask "
+                      "the printer to check its …",
+                      "a job from 192.0.2.10:50002 for 29 mm continuous tape goes to the printer unchecked: the "
+                      "loaded roll is 62mm continuous black/red (DK-22251), but it does not ask the printer to "
+                      "check its width"):
+            with self.assertRaises(AssertionError, msg=wrong):
+                self.check_unchecked_quote(wrong, wrong)
+
+    def test_quoted_reasons_are_proxyd_s(self):
+        checked = 0
+        for path in DOCS:
+            for span in code_spans(read(path)):
+                text = flat(span)
+                if self.check_refusal_quote(text, f"{rel(path)}: `{text}`"):
+                    checked += 1
+        self.assertGreater(checked, 5)
+
+    def test_quoted_unchecked_line_is_proxyd_s(self):
+        checked = 0
+        for path in DOCS:
+            for span in code_spans(read(path)):
+                text = flat(span)
+                if "goes to the printer unchecked" in text:
+                    checked += 1
+                    self.check_unchecked_quote(text, f"{rel(path)}: `{text}`")
+        self.assertGreater(checked, 0)
 
 
 class ConfigurationTableTest(unittest.TestCase):

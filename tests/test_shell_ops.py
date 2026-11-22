@@ -10,6 +10,9 @@
   settings change.
 * STATUS_MAX_AGE_SECONDS follows STATUS_POLL_SECONDS; LOG_LEVEL and the
   persona overrides reach runtime.env.
+* selftest.sh reports a check of ql810wc-proxyd that runtime.env turns off
+  (RAW_COLOR_CHECK in T1, RAW_MEDIA_CHECK in T0), and its hint for a printer
+  error puts the colour codes before "replace media".
 * Step 20 starts a CUPS that step 10 installed, and stops with exit 3 for one
   its admin stopped. "lpstat -r" exits 0 whether or not the scheduler runs,
   as real CUPS does: only its message tells.
@@ -36,7 +39,7 @@ import pathlib
 import re
 import subprocess
 import unittest
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from tests import test_shell_scripts as shell
 from tests._util import REPO
@@ -918,9 +921,13 @@ class RuntimeEnvDerivedTest(OpsTestCase):
         script = r'''
 source "$REPO/scripts/lib/common.sh"
 STATUS_POLL_SECONDS="$1" LOG_LEVEL="$2" RAW_BIDIRECTIONAL=On USB_PRODUCT_ID=209C MAX_JOB_BYTES=0065536
-RAW_COLOR_CHECK=Off
-for k in STATUS_MAX_AGE_SECONDS LOG_LEVEL RAW_BIDIRECTIONAL USB_PRODUCT_ID MAX_JOB_BYTES RAW_COLOR_CHECK; do
+RAW_COLOR_CHECK=Off RAW_MEDIA_CHECK=Y
+for k in STATUS_MAX_AGE_SECONDS LOG_LEVEL RAW_BIDIRECTIONAL USB_PRODUCT_ID MAX_JOB_BYTES RAW_COLOR_CHECK \
+         RAW_MEDIA_CHECK; do
   printf '%s=%s\n' "$k" "$(qlp_runtime_value "$k")"
+done
+for v in off 0 "" TRUE; do
+  RAW_MEDIA_CHECK="$v"; printf 'media(%s)=%s\n' "$v" "$(qlp_runtime_value RAW_MEDIA_CHECK)"
 done
 for p in 0 1 30 31 60 61 x; do printf 'age(%s)=%s\n' "$p" "$(qlp_status_max_age "$p")"; done
 '''
@@ -928,8 +935,9 @@ for p in 0 1 30 31 60 61 x; do printf 'age(%s)=%s\n' "$p" "$(qlp_status_max_age 
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout.splitlines(), [
             "STATUS_MAX_AGE_SECONDS=90", "LOG_LEVEL=WARNING", "RAW_BIDIRECTIONAL=yes", "USB_PRODUCT_ID=209c",
-            "MAX_JOB_BYTES=65536", "RAW_COLOR_CHECK=no", "age(0)=60", "age(1)=60", "age(30)=60", "age(31)=62", "age(60)=120",
-            "age(61)=60", "age(x)=60"])
+            "MAX_JOB_BYTES=65536", "RAW_COLOR_CHECK=no", "RAW_MEDIA_CHECK=yes",
+            "media(off)=no", "media(0)=no", "media()=no", "media(TRUE)=yes",
+            "age(0)=60", "age(1)=60", "age(30)=60", "age(31)=62", "age(60)=120", "age(61)=60", "age(x)=60"])
         text = (REPO / "selftest.sh").read_text(encoding="utf-8")
         match = re.search(r"(?ms)^runtime_env_checks\(\) \{\n(.*?)^\}", text)
         self.assertIsNotNone(match)
@@ -946,17 +954,22 @@ declare -A ST=() RT=()
 PRINT_TEST=0 MONO=0
 section() { :; }
 fact() { :; }
-check() { printf '%s|%s|%s\n' "$1" "$2" "$3"; }
+check() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "${*:4}"; }
 eval "$(sed -n '/^section_two_color() {/,/^}/p' "$REPO/selftest.sh")"
 ST[available]=1 ST[device_state]=ready ST[status_valid]=1 ST[media_two_color]="$1"
 if [[ "$2" != unset ]]; then RT[RAW_COLOR_CHECK]="$2"; fi
 section_two_color
 '''
 
-    def levels(self, two_color: str, value: str) -> List[str]:
+    def reports(self, two_color: str, value: str) -> List[Tuple[str, str, str]]:
+        """(section, level, message) of each t1.colorcheck line."""
         done = self.run_bash(self.SECTION, two_color, value)
         self.assertEqual(done.returncode, 0, done.stderr)
-        return [line.split("|")[1] for line in done.stdout.splitlines() if line.endswith("|t1.colorcheck")]
+        lines = [line.split("|", 3) for line in done.stdout.splitlines()]
+        return [(sec, level, msg) for sec, level, cid, msg in lines if cid == "t1.colorcheck"]
+
+    def levels(self, two_color: str, value: str) -> List[str]:
+        return [level for _sec, level, _msg in self.reports(two_color, value)]
 
     def test_reported_only_when_off(self):
         self.assertEqual(self.levels("1", "no"), ["warn"], "a black/red roll is loaded")
@@ -964,6 +977,79 @@ section_two_color
         self.assertEqual(self.levels("1", ""), ["warn"], "an empty value is off, as in the daemon")
         self.assertEqual(self.levels("1", "yes"), [])
         self.assertEqual(self.levels("1", "unset"), [], "not in runtime.env: the daemon's default, on")
+
+    def test_text(self):
+        # Not "every job goes to the printer unchecked": the media check may still be on.
+        self.assertEqual(self.reports("1", "no"), [
+            ("t1", "warn", "RAW_COLOR_CHECK is off: a black-only job reaches the printer, and after one on "
+                           "DK-22251 the printer needs a power cycle")])
+
+
+class MediaCheckPostureTest(OpsTestCase):
+    """selftest.sh's T0 section reports RAW_MEDIA_CHECK when runtime.env turns it off (the
+    media check guards every job, not only two-colour ones)."""
+
+    SECTION = r'''
+source "$REPO/scripts/lib/common.sh"
+declare -A ST=() RT=()
+PORT=9100 QLP_UNIT_SOCKET=sock QLP_UNIT_PROXYD=proxyd
+section() { printf '==|-|-|%s\n' "$1"; }
+fact() { :; }
+check() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "${*:4}"; }
+# The other T0 checks are not under test here.
+for f in unit_check listener_checks read_state wait_for_printer state_checks process_checks \
+         usb_exclusion_checks cups_queue_check firewall_t0; do eval "$f() { :; }"; done
+eval "$(sed -n -e '/^media_check_posture() {/,/^}/p' -e '/^section_data_plane() {/,/^}/p' "$REPO/selftest.sh")"
+ST[available]="$1"
+if [[ "$2" != unset ]]; then RT[RAW_MEDIA_CHECK]="$2"; fi
+section_data_plane
+'''
+    TEXT = ("RAW_MEDIA_CHECK is off: a job for other media than the loaded roll reaches the printer, which "
+            "may then stop until someone clears it at the printer")
+
+    def reports(self, available: str, value: str) -> List[Tuple[str, str, str]]:
+        """(section, level, message) of each t0.mediacheck line."""
+        done = self.run_bash(self.SECTION, available, value)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        lines = [line.split("|", 3) for line in done.stdout.splitlines()]
+        self.assertTrue(lines and lines[0][0] == "==" and lines[0][3].startswith("T0/T1 data plane"),
+                        "the T0 section's header comes first: " + done.stdout)
+        return [(sec, level, msg) for sec, level, cid, msg in lines if cid == "t0.mediacheck"]
+
+    def test_reported_only_when_off(self):
+        off = [("t0", "warn", self.TEXT)]
+        self.assertEqual(self.reports("1", "no"), off)
+        self.assertEqual(self.reports("0", "no"), off, "whatever the printer's state")
+        self.assertEqual(self.reports("1", ""), off, "an empty value is off, as in the daemon")
+        self.assertEqual(self.reports("1", "yes"), [])
+        self.assertEqual(self.reports("1", "unset"), [], "not in runtime.env: the daemon's default, on")
+
+
+class PrinterErrorHintTest(OpsTestCase):
+    """selftest.sh's printer_error_hint: the colour codes come before "replace media"."""
+
+    HINT = r'''
+eval "$(sed -n '/^printer_error_hint() {/,/^}/p' "$REPO/selftest.sh")"
+for errors in "$@"; do printf '%s\n' "$(printer_error_hint "$errors")"; done
+'''
+    COLOUR = "the last job's colour mode did not suit the loaded roll; switch the printer off and on"
+    MEDIA = ("the last job did not match the loaded roll: open and close the roll cover; if the error stays, "
+             "press the Cutter button; if it still stays, switch the printer off and on")
+
+    def test_hints(self):
+        cases = {
+            "media does not support monochrome printing": self.COLOUR,      # the tested unit needed a power cycle
+            "media does not support two-color printing": self.COLOUR,
+            "replace media, media does not support monochrome printing": self.COLOUR,   # the first arm wins
+            "replace media": self.MEDIA,                                     # Brother's reset order
+            "unsupported media": self.MEDIA,
+            "cover open, replace media": "close the printer cover",
+            "end of media": "load a DK roll",
+            "system error": "fix it at the printer, then re-run this test",
+        }
+        done = self.run_bash(self.HINT, *cases)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.splitlines(), list(cases.values()))
 
 
 class ConfigTemplateTest(unittest.TestCase):

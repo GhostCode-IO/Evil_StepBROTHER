@@ -78,7 +78,31 @@ class VersionAndStatusTest(QlctlTestCase):
         self.assertIn("62mm continuous black/red (DK-22251)  [two-color]", out)
         self.assertIn("Errors    none", out)
         self.assertIn("Job       last: ok, from 192.0.2.10:50000, 1234 bytes, two-color", out)
+        self.assertNotIn("requested", out, "state.json holds no media for this job")
         self.assertNotIn("STALE", out)
+
+    def test_status_shows_the_media_the_last_job_asked_for(self):
+        # job.requested_media is the job's first ESC i z; here the 29x90 mm die-cut paper (DC03) that
+        # Brother's macOS driver asks for by default.
+        requested = {"flags": 0x8E, "type": 0x0B, "width": 29, "length": 90, "lines": 991, "page": 0}
+        job = {"last_result": "refused", "peer": "192.0.2.10:50002", "bytes": 12582, "two_color": True,
+               "requested_media": requested, "last_finished": time.time() - 5}
+        self.write_state(state_doc(pid=os.getpid(), job=job))
+        done = self.qlctl("status")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertRegex(done.stdout, r"\nJob       last: refused, from 192\.0\.2\.10:50002, 12582 bytes, two-color, "
+                                      r"requested 29x90 mm die-cut, \d+s ago\n")
+        requested.update(flags=0x86, type=0x0A, width=62, length=0, lines=600)
+        self.write_state(state_doc(pid=os.getpid(), job=job))
+        done = self.qlctl("status")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(", two-color, requested 62 mm continuous, ", done.stdout)
+        job["requested_media"] = "62 mm"                  # not what ql810wc-proxyd writes: left out
+        self.write_state(state_doc(pid=os.getpid(), job=job))
+        done = self.qlctl("status")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn("requested", done.stdout)
+        self.assertIn("Job       last: refused, from 192.0.2.10:50002, 12582 bytes, two-color, ", done.stdout)
 
     def test_status_shows_why_the_last_job_failed(self):
         detail = ("a black-only job, but the loaded roll, 62mm continuous black/red (DK-22251), "
@@ -241,13 +265,14 @@ class TestPrintTest(QlctlTestCase):
         self.assertIn("sending anyway", done.stderr)
 
     def test_refuses_a_width_the_loaded_roll_does_not_have(self):
-        # The job's ESC i z sets "width valid": a 62 mm job on a 29 mm roll makes the
-        # printer report "replace media" until the roll cover is opened and closed.
+        # The job's ESC i z sets "width valid": Brother documents that a 62 mm job on a 29 mm roll
+        # makes the printer report "replace media", and owners report that it then stops.
         self.write_state(state_doc(media.synthesize_status(media.lookup_label("29")).raw))
         done = self.qlctl("test-print", "--mono", "--width", "62", "--port", "9")
         self.assertEqual(done.returncode, 3, done.stderr)
-        self.assertIn("29 mm wide but --width 62", done.stderr)
-        self.assertIn("replace media", done.stderr)
+        self.assertIn("the loaded roll is 29 mm wide but --width 62 was requested: the printer rejects the job "
+                      "('replace media') and may stop until someone clears it at the printer (or --force)",
+                      done.stderr)
         proxy = FakeProxy(self)
         done = self.qlctl("test-print", "--mono", "--width", "62", "--force", "--port", str(proxy.port))
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -317,6 +342,41 @@ class EndToEndTest(QlctlTestCase):
         self.assertIn("refused", done.stdout + done.stderr)
         self.assertIn("a two-color job, but the loaded roll, 62mm continuous", done.stdout + done.stderr)
         self.assertNotIn("Connection reset", done.stderr)
+        self.assertEqual(h.model.jobs, [])
+
+    def test_a_test_label_for_another_roll_the_daemon_refuses(self):
+        # DK-22251, the fake's roll, takes two-color jobs only and is 62 mm wide: a black-only
+        # 29 mm label fails the colour check and the width the job asks the printer to check.
+        from tests.test_proxyd import Harness      # the real ql810wc-proxyd with a fake printer
+        h = Harness(self).start()
+        done = subprocess.run([sys.executable, "-I", "-B", str(QLCTL), "--config", self.config,
+                               "--state", h.state_path, "test-print", "--mono", "--force", "--width", "29",
+                               "--port", str(h.port)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("sending anyway (--force)", done.stderr)
+        self.assertIn("a black-only job for 29 mm continuous tape, but the loaded roll is 62mm continuous "
+                      "black/red (DK-22251), which takes two-color jobs only", done.stdout + done.stderr)
+        self.assertNotIn("Connection reset", done.stderr)
+        self.assertEqual(h.model.jobs, [])
+        self.assertNotIn(rasterproto.make_test_job(29, False, "bars"), h.session_bytes())
+        done = subprocess.run([sys.executable, "-I", "-B", str(QLCTL), "--config", self.config,
+                               "--state", h.state_path, "status"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertRegex(done.stdout, r"\nJob       last: refused, from 127\.0\.0\.1:\d+, \d+ bytes, mono, "
+                                      r"requested 29 mm continuous, \d+s ago\n")
+
+    def test_a_test_label_only_the_media_check_refuses(self):
+        # A single-colour 29 mm roll takes a black-only label, but not one 62 mm wide.
+        from tests.test_proxyd import Harness      # the real ql810wc-proxyd with a fake printer
+        h = Harness(self)
+        h.model.set_media("29")
+        h.start()
+        done = subprocess.run([sys.executable, "-I", "-B", str(QLCTL), "--config", self.config,
+                               "--state", h.state_path, "test-print", "--mono", "--force", "--width", "62",
+                               "--port", str(h.port)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("a job for 62 mm continuous tape, but the loaded roll is 29mm continuous (DK-22210)",
+                      done.stdout + done.stderr)
         self.assertEqual(h.model.jobs, [])
 
     def test_stale_state_does_not_block_probe(self):

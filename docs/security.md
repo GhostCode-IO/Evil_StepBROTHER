@@ -50,8 +50,8 @@ are never touched, and neither are firewall rules the installer did not add.
 Like a real printer, the port accepts jobs from anyone who can reach it, and
 nobody can read anything back (`RAW_BIDIRECTIONAL="no"`). Jobs are streamed to
 USB and never stored. The journal records only metadata: the client's
-address, the size and duration, the colour mode, the requested media and the
-result.
+address, the size and duration, the colour mode, the requested media (with
+the job's line count and print flags) and the result.
 
 Residual risks within the allowed networks: wasted labels; a mono job on
 DK-22251 that reaches the printer (with `RAW_COLOR_CHECK="no"`, or when the
@@ -60,7 +60,12 @@ without `ESC i K`), which leaves it in an error until a power cycle; and,
 because jobs are served one at a time, a client that occupies the printer. A
 client that sends nothing is dropped after `RAW_IDLE_TIMEOUT` (default
 300 s), a vanished one after about a minute of failed TCP keepalives, and a
-job larger than `MAX_JOB_BYTES` (default 16 MiB) is cut off. Restrict the port with
+job larger than `MAX_JOB_BYTES` (default 16 MiB) is cut off. A job for other
+media than the loaded roll can also reach the printer (with
+`RAW_MEDIA_CHECK="no"`, or when the box cannot judge it). Brother documents
+that the printer rejects such a job, and owners of the QL-800 and QL-810W
+report that it then stops until someone clears it at the printer (not seen
+on the tested unit yet). Restrict the port with
 `RAW_ALLOWED_CIDRS` if the zone is wider than your printing clients. P-touch
 for Mac connects to the Bonjour host name and may use IPv6, so include the
 IPv6 client ranges.

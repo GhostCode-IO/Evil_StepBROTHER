@@ -31,12 +31,18 @@ journalctl -u ql810wc-proxyd -n 30 --no-pager
   from …`, `waiting for the printer: …` or `printer in Editor Lite mode: …`.
 - `qlctl status` shows what the daemon last saw: printer state (`ready`,
   `absent`, `mass-storage` or `error`) with the reason, the last status frame
-  and its age, the loaded roll, error bits and the last job's result. It
+  and its age, the loaded roll, error bits and the last job's result, with
+  the media it asked for and, for a refused job, the reason. It
   exits with 0 when the printer is ready without errors, 3 when it is not, and
   1 when there is no state file (`ql810wc-proxyd` is not running).
 - Every print leaves one journal line:
   `job from <client>: <n> bytes in <t> s, two-color|black only, requested …,
-  result ok|error|torn|refused (…)`.
+  <lines> lines (… mm of print), flags 0x…, result ok|error|torn|refused (…)`.
+  The `requested` part is the media the job asks for, the lines are the
+  length of its print, and the flags say which media fields the printer is
+  to check (`0x02` the type, `0x04` the width, `0x08` the length). All three
+  come from the `ESC i z` command of the job's first page; a job without one
+  has none of them.
 
 | Symptom | Section |
 |---|---|
@@ -52,7 +58,9 @@ journalctl -u ql810wc-proxyd -n 30 --no-pager
 | P-touch finds the printer but shows no roll | [SNMP checks](#snmp-checks) |
 | P-touch for Mac or iPrint&Label for iOS does not list the printer | [Bonjour checks](#bonjour-checks), [Firewall checks](#firewall-checks) |
 | iPrint&Label (iOS) shows a 1.4" label instead of the loaded roll | Use the app's **Check Media** ([client setup](client-setup.md#ios-brother-iprintlabel)) |
-| A job from PowerPoint or another Mac application prints nothing (macOS may show it as completed), or stops the printer | [Printer errors](#the-printer-shows-an-error-or-nothing-prints): `qlctl status` shows `refused`; set the driver's **Color** to **2-Color(Black/Red)** for DK-22251 |
+| A job from PowerPoint or another Mac application prints nothing (macOS may show it as completed, or pause its queue), or stops the printer | [Printer errors](#the-printer-shows-an-error-or-nothing-prints): `qlctl status` shows `refused` and why; for DK-22251 set the driver's **Color** to **2-Color(Black/Red)** and its paper size to `2.4"` or `62 mm` ([client setup](client-setup.md#printing-from-powerpoint-on-dk-22251)) |
+| A label from a Mac application is cut short | Brother's **Basic → Length** is shorter than the page ([client setup](client-setup.md#printing-from-powerpoint-on-dk-22251)) |
+| `replace media` in `qlctl status` or the selftest | [Printer errors](#the-printer-shows-an-error-or-nothing-prints): clear it at the printer |
 
 ## setup.sh problems
 
@@ -108,8 +116,8 @@ Its options and tiers are described in the
 |---|---|
 | `FAIL  no printer on USB` | Connect the printer and switch it on; it switches itself off after about an hour without `ql810wc-proxyd`'s status polls ([Switched off](#p-touch-says-the-printer-is-switched-off)). |
 | `FAIL  Editor Lite is ON` | [Editor Lite](#editor-lite-is-on) |
-| `FAIL  ql810wc-proxyd cannot use the printer` | [ipp-usb](#ipp-usb-holds-the-printer), [CUPS's usb backend](#cups-usb-backend-detaches-the-printer). When it says the printer does not answer status requests (for example after a mono job on DK-22251), switch the printer off and on ([Printer errors](#the-printer-shows-an-error-or-nothing-prints)). |
-| `FAIL  the printer reports: …`, `FAIL  no roll loaded` | Close the cover, load a roll or clear the jam, as the line says ([Printer errors](#the-printer-shows-an-error-or-nothing-prints)). |
+| `FAIL  ql810wc-proxyd cannot use the printer` | [ipp-usb](#ipp-usb-holds-the-printer), [CUPS's usb backend](#cups-usb-backend-detaches-the-printer). When it says the printer does not answer status requests (for example after a mono job on DK-22251), switch the printer off and on; after a job for other media than the loaded roll, open and close the roll cover first ([Printer errors](#the-printer-shows-an-error-or-nothing-prints)). |
+| `FAIL  the printer reports: …`, `FAIL  no roll loaded` | Close the cover, load a roll or clear the jam, as the line says ([Printer errors](#the-printer-shows-an-error-or-nothing-prints)). After a job that did not suit the loaded roll (`replace media`, or a colour error such as `media does not support monochrome printing`), the line says how to clear it at the printer. |
 | `FAIL  missing /usr/share/cups/usb/ql810wc-proxy.usb-quirks` | Attach the printer in printer mode, then run `sudo ./install.sh --only 20` ([CUPS's usb backend](#cups-usb-backend-detaches-the-printer)). |
 | `FAIL  ql810wc-proxyd used …% CPU … while idle` | [High CPU](#high-cpu-from-ql810wc-proxyd) |
 | `FAIL  nothing listens on TCP …` | `journalctl -u ql810wc-proxyd -n 50`; `sudo ./install.sh --only 20` starts stopped units again. |
@@ -121,7 +129,8 @@ Its options and tiers are described in the
 | `FAIL  the Bonjour record does not resolve`, `WARN  Avahi publishes the printer as …`, `WARN  no range in … is a subnet of this host` | [Bonjour checks](#bonjour-checks) |
 | `FAIL  firewall: … is missing in zone …` | Re-run `sudo ./install.sh` ([Firewall checks](#firewall-checks)). |
 | `FAIL  the persona reports the printer as switched off` | Fix the T0 lines first ([Switched off](#p-touch-says-the-printer-is-switched-off)). |
-| `WARN  last job: …` | The last print job did not print as it should; the line says why. `refused`: the box kept the job from the printer because the loaded roll cannot print its colour mode ([Printer errors](#the-printer-shows-an-error-or-nothing-prints)). |
+| `WARN  last job: …` | The last print job did not print as it should; the line says why. `refused`: the box kept the job from the printer because the loaded roll cannot take it, for its colour mode or for the media it asks for ([Printer errors](#the-printer-shows-an-error-or-nothing-prints)). |
+| `WARN  RAW_MEDIA_CHECK is off: …` | The media check is switched off in `config.env`, so a job for other media than the loaded roll reaches the printer. Brother documents that the printer rejects such a job when the job asks it to check the field that differs, and owners of the QL-800 and QL-810W report that it then stops until someone clears it at the printer (not seen on the tested unit yet) ([Printer errors](#the-printer-shows-an-error-or-nothing-prints)). Unless you need it off, set `RAW_MEDIA_CHECK="yes"` (the default) as root and run `sudo ./install.sh`. |
 | `WARN  RAW_COLOR_CHECK is off: …` | The colour check is switched off in `config.env`, so a black-only job on DK-22251 reaches the printer, which then needs a power cycle. Unless you need it off, set `RAW_COLOR_CHECK="yes"` (the default) as root and run `sudo ./install.sh`. When the printer does not report a black/red roll (another roll or no roll is loaded, or there is no status from the printer), the line is `INFO`. |
 | `WARN  … cannot reload: its unit file is outdated`, `WARN  … rejected its last reload` | Re-run `sudo ./install.sh`; for a rejected reload, `journalctl -u ql810wc-snmp-agent` names the file and the problem ([Logs](#logs)). |
 | `DEGRADED: T0-T2 with manual media` | The printer's status block does not fit the shipped OID map: select the roll by hand in P-touch, and attach the `--json` output to a bug report on the [issue tracker](https://github.com/GhostCode-IO/Evil_StepBROTHER/issues). |
@@ -236,18 +245,60 @@ project never changes printer settings.
 
 ## The printer shows an error, or nothing prints
 
-- **`refused a print job from …: a black-only job, but the loaded roll, …
-  (DK-22251), takes two-color jobs only`**, and a job line with
-  `result refused`: the job asked for black-only printing while DK-22251 was
-  loaded, which the printer rejects (see the next point). None of its print
-  data reached the printer, and the client's connection was reset; the
-  application may still show the print as completed (macOS does when the
-  reset arrives after its last write). Print it
-  again in 2-colour mode (see [client setup](client-setup.md#media-rules)):
-  with Brother's driver for macOS, set **Color** to **2-Color(Black/Red)**,
-  as its default is **Monochrome**. `… a two-color job, but the loaded roll,
-  …, cannot print red` is the reverse: print black only, or load DK-22251.
-  `RAW_COLOR_CHECK="no"` turns this check off.
+- **`refused a print job from …: <reason>. None of its print data was sent
+  to the printer`**, and a job line with `result refused (<reason>)`: one of
+  the box's checks kept the job from the printer, because the loaded roll
+  cannot take it. Nothing printed, and the client's connection was reset.
+  The application may still show the print as completed (macOS does when the
+  reset arrives after its last write; with a larger job it may pause its
+  queue instead, see [client setup](client-setup.md#printing-from-powerpoint-on-dk-22251)).
+  `qlctl status` shows the reason too. Change the job in the client and
+  print it again:
+  - `a black-only job, but the loaded roll, … (DK-22251), takes two-color
+    jobs only` (the colour check, `RAW_COLOR_CHECK`): the job asked for
+    black-only printing while DK-22251 was loaded, which the printer rejects
+    (see "A mono job on DK-22251" below). Print it in 2-colour mode (see
+    [client setup](client-setup.md#media-rules)): with Brother's driver for
+    macOS, set **Color** to **2-Color(Black/Red)**, as its default is
+    **Monochrome**.
+  - `a two-color job, but the loaded roll, …, cannot print red` is the
+    reverse: print black only, or load DK-22251.
+  - `a job for 29x90 mm die-cut labels, but the loaded roll is 62mm
+    continuous black/red (DK-22251)` (the media check, `RAW_MEDIA_CHECK`):
+    the job asks for other media than the loaded roll, and Brother documents
+    that the printer rejects it. Choose the loaded roll's paper size in the
+    client (for DK-22251, `2.4"` or `62 mm` in Brother's driver for macOS,
+    whose default is `1.1" x 3.5"`), use **Check Media** in iPrint&Label,
+    or load the roll the job is for.
+  - `a black-only job for 29x90 mm die-cut labels, but the loaded roll is
+    62mm continuous black/red (DK-22251), which takes two-color jobs only`:
+    both at once. Fix the paper size and the colour.
+  - `a two-color job in high resolution mode, but the loaded roll, 62mm
+    continuous black/red (DK-22251), prints two colors in standard
+    resolution only` (the media check): set Brother's **Basic → Quality** to
+    **Give priority to print speed** or **Give priority to print quality**.
+    With the wrong paper size as well, the reason reads `a two-color job for
+    … in high resolution mode, but the loaded roll is …, which prints two
+    colors in standard resolution only`.
+
+  `RAW_COLOR_CHECK="no"` and `RAW_MEDIA_CHECK="no"` turn the checks off, and
+  the printer then gets such jobs.
+- **`a job from … for … goes to the printer unchecked: the loaded roll is …,
+  but the job does not ask the printer to check its …`** (`INFO`): the job
+  asks for other media than the loaded roll, but only in fields that it does
+  not ask the printer to check. Brother documents that the printer then does
+  not check them, so the box lets the job through. If the label comes out
+  wrong, choose the loaded roll's paper size in the client.
+- **`replace media`** in `qlctl status`, or in `FAIL  the printer reports: …`:
+  a job for other media than the loaded roll reached the printer, with
+  `RAW_MEDIA_CHECK="no"` or when the box could not judge the job (no recent
+  status, no roll or an unknown roll, a printer fault, or a job that did not
+  show its media before its first raster row). Clear it the way Brother's
+  guide says: open and close the roll cover; if the error stays, press the
+  Cutter button; if it still stays, switch the printer off and on. Other
+  owners report that until then a QL-800 answered no status request, and
+  that a QL-810W kept later jobs and printed them once the error was
+  cleared. Not seen on the tested unit yet.
 - **A mono job on DK-22251 that reached the printer** (with
   `RAW_COLOR_CHECK="no"`, or when the box could not tell the job's colour
   mode or the loaded roll)
@@ -274,16 +325,20 @@ project never changes printer settings.
   row find it idle; if it did not answer, later status requests (or its
   reopen) repeat the resync. Either way, a partial label may have printed.
   When the detail ends with `none of its print data was sent to the
-  printer`, the job was still held back for the colour check: nothing
-  printed, and the printer needed no resync.
+  printer`, the job was still held back for the checks (`RAW_COLOR_CHECK`,
+  `RAW_MEDIA_CHECK`): nothing printed, and the printer needed no resync for
+  it. With `the printer took the check's status request only in part`
+  before that, the printer did not take the whole status request the checks
+  sent while they held the job, so the job was not sent behind it; the next
+  status request resynchronises the printer.
 - **`closed the connection in the middle of a job (no 0x1A)`**, then a job
   line with `result error (the client closed the connection before the end
   of the job)`: the client closed its side before the `0x1A` that ends the
   job, and the printer was resynchronised (when the line ends with `printer
   resynchronisation pending`, that is still to come, as above). The same job
   line ending `none of its print data was sent to the printer`, with no line
-  before it, is a job still held back for the colour check: nothing reached
-  the printer.
+  before it, is a job still held back for the checks: nothing reached the
+  printer.
 - **`turned away a print job from … (printer not available: …)`**: the
   printer was absent, in Editor Lite mode or unusable when the client
   connected. The client got an immediate connection reset, and the job is
@@ -304,12 +359,17 @@ project never changes printer settings.
 - **`stream not fully parsed (…)`** in a job line is informational: the
   observer did not recognise a command. The job was still forwarded
   unchanged, unless the line says `result refused`: the job had shown its
-  colour mode before that command, and none of its print data reached the
-  printer.
+  colour mode and media before that command, and none of its print data
+  reached the printer.
 - **Cover open** shows as `cover open` in `qlctl status` (the printer reports
   status type `02` with error 2 bit `0x10`). Third-party reports say a
   QL-810W holds a job during such a fault and prints it afterwards; not
-  checked on the tested unit.
+  checked on the tested unit. While the printer reports a fault, the media
+  check does not judge jobs: the printer is expected to check the roll it
+  has once it goes on (not checked on the tested unit either). A status
+  read earlier that shows no roll or a fault is read again before the job
+  is judged: closing the roll cover sends no status, so a roll just loaded
+  shows only at the next poll.
 - **`result ok` but no label** on a new unit: a third-party report for the
   QL-810W says raster jobs need the printer's command mode set to raster
   (some units ship in P-touch Template mode). Brother's printer setting tools

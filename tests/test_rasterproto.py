@@ -391,6 +391,18 @@ def random_sizes(rng: random.Random):
         yield rng.choice((1, 2, 3, 4, 5, 13, 64, 93, 131, 400, 4096))
 
 
+#: The set-up of a job (400 x NUL, ESC @, ESC i a 01) and short raster lines for the decided_media tests.
+DECIDED_SETUP = rp.INVALIDATE + rp.ESC_INIT + b"\x1b\x69\x61\x01"
+DECIDED_ROW_W = b"\x77\x01\x02\xff\x00" + b"\x77\x02\x02\x00\x00"
+DECIDED_ROW_G = b"\x67\x00\x02\xff\x00"
+
+
+def print_info(info: dict) -> bytes:
+    """``ESC i z`` for a requested_media dict."""
+    return (b"\x1b\x69\x7a" + bytes((info["flags"], info["type"], info["width"], info["length"]))
+            + info["lines"].to_bytes(4, "little") + bytes((info["page"], 0)))
+
+
 class TokenizerTest(unittest.TestCase):
     def test_test_job_is_parsed(self):
         job = rp.make_test_job()
@@ -657,6 +669,115 @@ class TokenizerTest(unittest.TestCase):
         tok.feed(rp.ESC_INIT + b"\x1b\x69\x4b\x08" + b"\x1b\x69\x58\x00" + b"\x67\x00\x01\x00\x1a")
         self.assertIsNotNone(tok.opaque)
         self.assertFalse(tok.color_decided, "nothing is decided once the stream is opaque")
+
+    def test_decided_media_is_what_the_first_page_asks_for(self):
+        """decided_media / decided_expanded_mode: copies of requested_media and
+        expanded_mode taken where the colour mode is decided (the first g/w
+        raster row), so the following pages do not change them."""
+        page1 = {"flags": 0x8E, "type": 0x0A, "width": 62, "length": 0, "lines": 2, "page": 0}
+        page2 = {"flags": 0x8E, "type": 0x0B, "width": 29, "length": 90, "lines": 2, "page": 1}
+        head = DECIDED_SETUP + print_info(page1) + b"\x1b\x69\x4b\x09"
+        tok = rp.RasterTokenizer()
+        tok.feed(head + DECIDED_ROW_W[:2])
+        self.assertFalse(tok.color_decided)
+        self.assertEqual(tok.requested_media, page1)
+        self.assertIsNone(tok.decided_media, "nothing is decided before the first raster row")
+        self.assertIsNone(tok.decided_expanded_mode)
+        tok.feed(DECIDED_ROW_W[2:])
+        self.assertTrue(tok.color_decided)
+        self.assertEqual(tok.decided_media, page1)
+        self.assertIsNot(tok.decided_media, tok.requested_media, "a copy")
+        self.assertEqual(tok.decided_expanded_mode, 0x09)
+        tok.feed(b"\x0c" + print_info(page2) + b"\x1b\x69\x4b\x48" + DECIDED_ROW_G + b"\x1a")
+        self.assertEqual((tok.jobs, tok.pages), (1, 2))
+        self.assertEqual(tok.requested_media, page2, "the last ESC i z")
+        self.assertEqual(tok.expanded_mode, 0x48)
+        self.assertEqual(tok.decided_media, page1, "page 1's")
+        self.assertEqual(tok.decided_expanded_mode, 0x09)
+        self.assertIs(tok.requested_two_color, True)
+
+    def test_decided_media_of_a_multi_page_job_in_one_feed(self):
+        """proxyd may get a whole multi-page job in one read: requested_media is
+        then the last page's header, decided_media page 1's, however it is split."""
+        page1 = {"flags": 0x86, "type": 0x0A, "width": 62, "length": 0, "lines": 2, "page": 0}
+        page2 = {"flags": 0x8E, "type": 0x0B, "width": 29, "length": 90, "lines": 2, "page": 1}
+        job = (DECIDED_SETUP + print_info(page1) + b"\x1b\x69\x4b\x09" + DECIDED_ROW_W * 2 + b"\x0c"
+               + print_info(page2) + b"\x1b\x69\x4b\x09" + DECIDED_ROW_W * 2 + b"\x1a")
+        whole = rp.RasterTokenizer()
+        whole.feed(job)
+        self.assertEqual(whole.requested_media, page2)
+        self.assertEqual(whole.decided_media, page1)
+        self.assertEqual(whole.decided_expanded_mode, 0x09)
+        summary = whole.summary()
+        rng = random.Random(2435)
+        for sizes in [iter(lambda: 1, 0)] + [random_sizes(rng) for _ in range(10)]:
+            self.assertEqual(feed_all(job, sizes)[1], summary)
+
+    def test_decided_media_at_a_print_command_without_a_row(self):
+        info = {"flags": 0x8E, "type": 0x0B, "width": 29, "length": 90, "lines": 20, "page": 0}
+        tok = rp.RasterTokenizer()
+        tok.feed(DECIDED_SETUP + print_info(info) + b"\x1b\x69\x4b\x08" + b"\x5a" * 20)
+        self.assertIsNone(tok.decided_media, "blank lines decide nothing")
+        tok.feed(b"\x1a")
+        self.assertEqual(tok.decided_media, info)
+        self.assertEqual(tok.decided_expanded_mode, 0x08)
+        self.assertIs(tok.requested_two_color, False)
+
+    def test_decided_media_is_none_without_its_commands(self):
+        info = {"flags": 0x86, "type": 0x0A, "width": 62, "length": 0, "lines": 2, "page": 0}
+        cases = {
+            # ESC @ clears requested_media and expanded_mode, so it leaves nothing to copy.
+            "ESC @ before the first row": print_info(info) + b"\x1b\x69\x4b\x09" + rp.ESC_INIT + DECIDED_ROW_W,
+            "no ESC i z": b"\x1b\x69\x4b\x09" + DECIDED_ROW_W,
+            "ESC i z after the first row": b"\x1b\x69\x4b\x09" + DECIDED_ROW_W + print_info(info),
+        }
+        for name, content in cases.items():
+            with self.subTest(name):
+                tok = rp.RasterTokenizer()
+                tok.feed(DECIDED_SETUP + content + b"\x1a")
+                self.assertTrue(tok.color_decided)
+                self.assertIsNone(tok.decided_media)
+        tok = rp.RasterTokenizer()
+        tok.feed(DECIDED_SETUP + print_info(info) + DECIDED_ROW_G + b"\x1a")
+        self.assertEqual(tok.decided_media, info)
+        self.assertIsNone(tok.decided_expanded_mode, "no ESC i K")
+        self.assertIsNone(tok.requested_two_color)
+        tok = rp.RasterTokenizer()
+        tok.feed(DECIDED_SETUP + print_info(info) + b"\x1b\x69\x4b\x09" + b"\x1b\x69\x58\x00" + DECIDED_ROW_W)
+        self.assertIsNotNone(tok.opaque)
+        self.assertFalse(tok.color_decided)
+        self.assertIsNone(tok.decided_media, "nothing is decided once the stream is opaque")
+
+    def test_decided_media_is_per_job(self):
+        first = {"flags": 0x86, "type": 0x0A, "width": 62, "length": 0, "lines": 2, "page": 0}
+        second = {"flags": 0x8E, "type": 0x0B, "width": 29, "length": 90, "lines": 2, "page": 0}
+        tok = rp.RasterTokenizer()
+        tok.feed(DECIDED_SETUP + print_info(first) + b"\x1b\x69\x4b\x09" + DECIDED_ROW_W + b"\x1a")
+        self.assertEqual(tok.decided_media, first)
+        tok.feed(DECIDED_SETUP)
+        self.assertEqual(tok.decided_media, first, "kept until the next job's content starts")
+        self.assertEqual(tok.decided_expanded_mode, 0x09)
+        tok.feed(print_info(second))
+        self.assertIsNone(tok.decided_media, "the next job's content started")
+        self.assertIsNone(tok.decided_expanded_mode)
+        tok.feed(b"\x1b\x69\x4b\x48" + DECIDED_ROW_G)
+        self.assertEqual(tok.decided_media, second)
+        self.assertEqual(tok.decided_expanded_mode, 0x48)
+        tok.reset()
+        self.assertIsNone(tok.decided_media)
+        self.assertIsNone(tok.decided_expanded_mode)
+
+    def test_summary_includes_the_decided_media(self):
+        self.assertIsNone(rp.RasterTokenizer().summary()["decided_media"])
+        self.assertIsNone(rp.RasterTokenizer().summary()["decided_expanded_mode"])
+        tok = rp.RasterTokenizer()
+        tok.feed(rp.make_test_job(rows=150))
+        summary = tok.summary()
+        self.assertEqual(summary["decided_media"], {"flags": 0x86, "type": 0x0A, "width": 62, "length": 0,
+                                                    "lines": 150, "page": 0})
+        self.assertEqual(summary["decided_expanded_mode"], 0x09)
+        self.assertIsNot(summary["decided_media"], tok.decided_media)
+        self.assertEqual(json.loads(json.dumps(summary)), summary)
 
     def test_media_block(self):
         record = b"\x01" + bytes(range(127))
@@ -946,6 +1067,22 @@ class MakeTestJobTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     rp.make_test_job(rows=bad)
 
+    def test_header_flags_are_unchanged(self):
+        """ESC i z n1 0x86 (recovery, width, type: the printer checks the tape's
+        type and width) and ESC i K 09 / 08, whatever the width."""
+        self.assertEqual(rp.PI_RECOVER | rp.PI_WIDTH | rp.PI_KIND, 0x86)
+        self.assertEqual(rp.EXPANDED_CUT_AT_END | rp.EXPANDED_TWO_COLOR, 0x09)
+        variants = [(62, True, 0x09), (62, False, 0x08)] + [(w, False, 0x08) for w in (12, 29, 38, 50, 54)]
+        for width, two_color, expanded in variants:
+            with self.subTest(width=width, two_color=two_color):
+                job = rp.make_test_job(width_mm=width, two_color=two_color, rows=150)
+                z = job.index(b"\x1b\x69\x7a")
+                self.assertEqual(job[:z], rp.INVALIDATE + rp.ESC_INIT + b"\x1b\x69\x61\x01")
+                self.assertEqual(job[z:z + 13], b"\x1b\x69\x7a\x86\x0a" + bytes((width, 0))
+                                 + (150).to_bytes(4, "little") + b"\x00\x00")
+                self.assertEqual(job[z + 13:z + 30], b"\x1b\x69\x4d\x40" + b"\x1b\x69\x41\x01"
+                                 + b"\x1b\x69\x4b" + bytes((expanded,)) + b"\x1b\x69\x64\x23\x00")
+
     def test_argument_validation(self):
         with self.assertRaises(ValueError):
             rp.make_test_job(width_mm=61)
@@ -964,6 +1101,17 @@ class ConstantsTest(unittest.TestCase):
         self.assertEqual(rp.STATUS_REQUEST, b"\x1b\x69\x53")
         self.assertEqual(rp.STATUS_LEN, 32)
         self.assertEqual(rp.RESYNC, rp.INVALIDATE + rp.ESC_INIT)
+
+    def test_print_information_and_expanded_mode_bits(self):
+        # ESC i z n1 (Brother's raster reference names) and ESC i K bits.
+        self.assertEqual((rp.PI_KIND, rp.PI_WIDTH, rp.PI_LENGTH, rp.PI_QUALITY, rp.PI_RECOVER),
+                         (0x02, 0x04, 0x08, 0x40, 0x80))
+        self.assertEqual((rp.EXPANDED_TWO_COLOR, rp.EXPANDED_CUT_AT_END, rp.EXPANDED_HIGH_RESOLUTION),
+                         (0x01, 0x08, 0x40))
+        # Brother's macOS driver: 0x8E (0xCE with a quality setting), ESC i K 49 for 2-Color + High resolution.
+        self.assertEqual(rp.PI_RECOVER | rp.PI_LENGTH | rp.PI_WIDTH | rp.PI_KIND, 0x8E)
+        self.assertEqual(0x8E | rp.PI_QUALITY, 0xCE)
+        self.assertEqual(rp.EXPANDED_HIGH_RESOLUTION | rp.EXPANDED_CUT_AT_END | rp.EXPANDED_TWO_COLOR, 0x49)
 
     def test_tables(self):
         self.assertEqual(rp.STATUS_TYPES[0x00], "reply to status request")

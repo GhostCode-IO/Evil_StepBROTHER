@@ -114,37 +114,91 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
   order, or not at all. The stream is tokenized but never modified (job end
   `0x1A`, two-color bit in `ESC i K`, requested media in `ESC i z`, embedded
   `ESC i S`). What the tokenizer sees decides when bytes go out and which
-  never do: the bytes held back for a job's colour check, when the check
-  refuses the job or the connection ends before the job shows its colour
-  mode, and an incomplete command a connection ends in outside a job (see
-  **Colour check**, **Trailer handling** and **Set-up commands** below).
-  Unknown opcodes switch the tokenizer to "opaque" and forwarding continues.
-- **Colour check** (`RAW_COLOR_CHECK`, default `yes`): a job's print data
-  (everything from its first command that is not NUL padding, a set-up or a
-  post-job command) is held back, with the rest of the read it starts in,
-  until the job shows its colour mode. That is at its first `g` or `w` raster
-  row (or, without one, its first print command): bit 0 of its last
-  `ESC i K`, as long as the row agrees (`w` with the bit set, `g` without).
-  Brother's QL-810W driver for macOS sends `ESC i K 0a` and `g` rows for
-  Monochrome, `ESC i K 0b` and `w` rows for 2-Color (its own filter, run on a
-  Mac; see `dev/notes/README.md`). When a status frame from the last
-  `STATUS_MAX_AGE_SECONDS` (asked for at that moment if the last one is older
-  and the printer's input state is known) shows a black/red roll (byte 25
-  `0x81`) and the job is black only, or a single-colour roll (`0x01`) and the
-  job is two-colour, the job is refused: none of its print data reaches the
-  printer, `state.json` records `refused`, and the client gets a RST once
-  that is written. The printer itself rejects such a job ("media does not
-  support monochrome printing"; "... two-color printing" per Brother's SDK
-  **(unverified)**), and the tested unit, after a black-only job on DK-22251,
-  answered no status request until it was switched off and on. Anything
-  uncertain goes through unchecked: no `ESC i K`, a row that contradicts it,
-  a stream that turns opaque before the job shows its mode, no recent frame,
-  no roll, another byte-25 value, or 256 KiB held before the job shows its
-  mode (no `g` or `w` row and no print command yet; `Z` blank lines do not
-  count). A job that ends while it is held back sent no print data to the
-  printer, so its end never calls for a resync. Over raw TCP the RST is all a
-  client learns: macOS's CUPS backend shows the job as completed when the RST
-  arrives after its last write.
+  never do: the bytes held back for a job's checks, when the checks refuse
+  the job or the connection ends before the job shows what it asks for, and
+  an incomplete command a connection ends in outside a job (see
+  **Colour and media checks**, **Trailer handling** and **Set-up commands**
+  below). Unknown opcodes switch the tokenizer to "opaque" and forwarding
+  continues.
+- **Colour and media checks** (`RAW_COLOR_CHECK` and `RAW_MEDIA_CHECK`, both
+  default `yes`): a job's print data (everything from its first command that
+  is not NUL padding, a set-up or a post-job command) is held back, with the
+  rest of the read it starts in, until the job shows what it asks for. That
+  is at its first `g` or `w` raster row (or, without one, its first print
+  command). There its colour mode is bit 0 of its last `ESC i K`, as long as
+  the row agrees (`w` with the bit set, `g` without); its media is its last
+  `ESC i z`; and high resolution is bit 6 (`0x40`) of that `ESC i K`. The
+  tokenizer keeps copies of both commands from that point
+  (`decided_media`, `decided_expanded_mode`), so the job's first page
+  decides even when later pages arrive in the same read; later pages are
+  not checked. Brother's QL-810W driver for macOS sends `ESC i K 0a` and
+  `g` rows for Monochrome, `ESC i K 0b` and `w` rows for 2-Color (its own
+  filter, run on a Mac; see `dev/notes/README.md`). The checks judge the
+  roll by a status frame from the last `STATUS_MAX_AGE_SECONDS`, asked for
+  at that moment if the last one is older and the printer's input state is
+  known. A status read earlier that shows no roll or a fault is read again
+  before the job is judged, for the colour rule too: a roll swap passes
+  through both (cover open, roll out), and closing the roll cover sends no
+  status, so a roll just loaded shows only at the next poll. This read, too,
+  needs a known input state.
+  The job is refused when:
+  - **colour** (`RAW_COLOR_CHECK`): the frame shows a black/red roll (byte
+    25 `0x81`) and the job is black only, or a single-colour roll (`0x01`)
+    and the job is two-colour. The printer itself rejects such a job ("media
+    does not support monochrome printing"; "... two-color printing" per
+    Brother's SDK **(unverified)**), and the tested unit, after a black-only
+    job on DK-22251, answered no status request until it was switched off
+    and on.
+  - **media** (`RAW_MEDIA_CHECK`, `media.compare_media`): a field of the
+    job's `ESC i z` that its n1 flags ask the printer to check (`0x02` media
+    type, `0x04` width, `0x08` length) differs from the roll. The type
+    (`0x0A` or `0x0B`; other values are not judged) is compared with byte
+    11's low nibble, the width (unless 0) with byte 10, and the length, on a
+    die-cut roll only, with byte 17, within ±1 mm (`LENGTH_TOLERANCE_MM`:
+    the printer reports a rounded length). Continuous tape takes any length,
+    and the raster line count is never compared. Also refused: a two-colour
+    job with `ESC i K` bit 6 (high resolution) on a black/red roll. Brother's
+    raster reference says that the printer checks only the flagged fields
+    and reports a mismatch as error information 2 bit 0, "replace media";
+    its user's guide says that high resolution cannot be used with
+    two-colour printing, and lists a "Two-color media high resolution
+    printing error". QL-800 and QL-810W owners report that after "replace
+    media" the printer stops until the roll cover is opened and closed
+    **(unverified on the QL-810Wc)**. The media rules are judged only while
+    the frame shows no fault (cover open, no or end of media, any error):
+    through a fault the printer holds jobs (third-party reports) and
+    presumably checks the roll it has when it resumes **(unverified)**. The
+    size rules are not judged for a roll that
+    `media.describe(..., exact=False)` does not know.
+
+  A refusal judged on a frame read before the verdict (an idle poll) is
+  confirmed first: the proxy sends one more `ESC i S`, and the reply
+  decides, whatever it shows (another roll, no roll, a fault); without a
+  reply the earlier frame stands. None of the job has reached the printer
+  then, so it stands between commands. A job is never delayed by two
+  status requests in one verdict: when the checks already asked during
+  this verdict (answered or not), no confirm read follows. A refused job:
+  none of its print data reaches the printer, `state.json` records
+  `refused` with the reason, and the client gets a RST once that is
+  written. Over raw TCP the RST is all a client learns: macOS's CUPS
+  backend shows the job as completed when the RST arrives after its last
+  write. Anything uncertain goes through unchecked. Nothing is judged for a
+  stream that turns opaque before the job shows its mode, without a recent
+  frame, without a roll, or after 256 KiB held before the job shows its
+  mode (`_CHECK_HOLD_LIMIT`: no `g` or `w` row and no print command yet;
+  `Z` blank lines do not count). The colour rule needs an `ESC i K` before
+  that point, a row that agrees with it and a byte 25 of `0x81` or `0x01`;
+  the size rules need an `ESC i z` before that point, and the
+  high-resolution rule needs the colour rule's two-colour `ESC i K` and a
+  row that agrees with it (an `ESC @` there clears both commands). A job
+  whose media differs from the roll only in fields it does not flag goes
+  through, with an INFO line in the journal (`a job from … for … goes to
+  the printer unchecked: …`). A job that ends while it is held back sent no
+  print data to the printer, so its end never calls for a resync. The
+  checks' own `ESC i S` goes out while the job is held: if the printer
+  takes it only in part, the job ends torn without any of its data sent
+  (never released behind the partial command), and the next status
+  request resynchronises the printer.
 - **Connection lifecycle:** close **only** after the client half-closes (EOF)
   or after `RAW_IDLE_TIMEOUT` seconds without data (default 300). **Never close
   on a timer after `0x1A`.** P-touch for Mac sends a trailer on the same
@@ -158,8 +212,9 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
   outside a job, it is kept back and then dropped (see **Set-up commands**).
   Never resync on them, never count them as a torn job. (P-touch also writes
   a bare `ESC i S` here on its PRN/template paths; it is held and forwarded
-  the same way.) Per-connection state: `IDLE → CHECKING (colour check) → WRITING →
-  SETTLING (after 0x1A: trailer held, post-job polls) → IDLE`.
+  the same way.) Per-connection state: `IDLE → CHECKING (colour and media
+  checks) → WRITING → SETTLING (after 0x1A: trailer held, post-job polls) →
+  IDLE`.
 - **Limits:** `SO_KEEPALIVE` with short timers, `RAW_IDLE_TIMEOUT` (300 s) and
   `MAX_JOB_BYTES` (16 MiB), both settable in `config.env`. One silent client
   must not block later jobs.
@@ -185,7 +240,7 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
   `0x1A`: RST/error, `RAW_IDLE_TIMEOUT` or `MAX_JOB_BYTES`. Parser state alone
   (for example an "opaque" stream) never makes a job torn. Recovery is
   400×`0x00` + `ESC @` to resynchronise the printer (not needed for a job
-  still held back for the colour check, which sent no print data). The real
+  still held back for the checks, which sent no print data). The real
   printer would stay BUSY until power-cycled. A torn job may print a partial
   label first.
 - **Tokenizer extras:** `ESC i U t` + 2 bytes (from P-touch's trailer;
@@ -197,11 +252,12 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
   counted from then on. As long as nothing has followed it, the stream still
   stands at a command boundary, so the idle polls go on while the client
   keeps the connection open. A second job sent on the same connection after
-  P-touch's trailer is forwarded unchanged but not tracked: its bytes count
-  as the first job's trailer, and proxyd does not poll the printer again
-  until that connection closes. A connection held open like that for longer
-  than `STATUS_MAX_AGE_SECONDS` makes the persona report the printer as
-  switched off until it closes (P-touch closes about 1 s after its trailer).
+  P-touch's trailer is forwarded unchanged but neither tracked nor checked:
+  its bytes count as the first job's trailer, and proxyd does not poll the
+  printer again until that connection closes. A connection held open like
+  that for longer than `STATUS_MAX_AGE_SECONDS` makes the persona report the
+  printer as switched off until it closes (P-touch closes about 1 s after
+  its trailer).
 - **Set-up commands:** `ESC @`, `ESC i a 01` and `ESC i !` are not job
   content either. A connection with nothing but NULs, set-up commands and
   `ESC i S` is no job. iPrint&Label for iOS opens 402-byte connections of
@@ -222,8 +278,8 @@ to `sys.path` explicitly. Runtime needs only the stdlib + `python3-pyyaml`
   line, if the connection ends first), so where a read ends never leaves the
   printer waiting inside a command. After a settled job the next job starts
   at its first print-data command, which need not be its `ESC i z` (an
-  `ESC i U J` may come first), so the colour check holds it from that
-  command, with the rest of the read it starts in. NULs and set-up commands
+  `ESC i U J` may come first), so the checks hold it from that command,
+  with the rest of the read it starts in. NULs and set-up commands
   that arrived in an earlier read were forwarded already and count as the
   previous job's trailer. While
   set-up commands wait on an open connection for a job, the idle polls
@@ -311,8 +367,10 @@ or unparseable files as "printer unknown".
 
 proxyd also writes `device.detail` (why the printer is not ready),
 `status.media` (the roll as P-touch would recognise it), `status.source`
-(`reply` to a status request, or `unsolicited`), `job.requested_media` and
-`job.last_detail`. Readers ignore fields they do not know.
+(`reply` to a status request, or `unsolicited`), `job.requested_media` (the
+`ESC i z` of the job's first page: `flags`, `type`, `width`, `length`,
+`lines`, `page`) and `job.last_detail` (for `refused`, the checks' reason).
+Readers ignore fields they do not know.
 `device.firmware` is reserved for the printer's firmware version, which
 `selftest.sh` matches against the OID map's `validated_firmware` (§7); proxyd
 does not write it today.
@@ -525,8 +583,10 @@ persona over SNMP from 127.0.0.1 (with a private client configuration, so no
   `t2.listen.ipv6` (IPv6 client ranges, but no UDP 161 listener on IPv6),
   `host.reach` (`SNMP_V3_ALLOWED_CIDRS` holds only documentation ranges),
   `t2.agent.canreload` (the agent's unit file cannot reload, so new settings
-  would need a restart) and `t2.agent.reload` (the agent rejected its last
-  reload).
+  would need a restart), `t2.agent.reload` (the agent rejected its last
+  reload), and `t0.mediacheck` and `t1.colorcheck` (`runtime.env` turns
+  `RAW_MEDIA_CHECK` or `RAW_COLOR_CHECK` off; `t1.colorcheck` is only
+  `info` unless a black/red roll is loaded).
 - The SNMPv3 bonus is reached when the SNMPv3 user reads the host's own
   `sysDescr` in the default context and no community leaked host data. It is
   skipped while SNMPv3 is off, and it never moves the ladder.

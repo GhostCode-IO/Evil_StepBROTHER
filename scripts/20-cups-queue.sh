@@ -55,8 +55,8 @@ validate_config() {
   local re_queue='^[A-Za-z0-9_.-]{1,127}$'
   qlp_valid_port "${RAW_PORT:-}" || die "config: RAW_PORT='${RAW_PORT:-}' is not a TCP port (1-65535)"
   qlp_require_bool CUPS_QUEUE_SHARED IPP_USB_EXCLUDE
-  # RAW_BIDIRECTIONAL, RAW_COLOR_CHECK, STATUS_POLL_SECONDS, RAW_IDLE_TIMEOUT, MAX_JOB_BYTES:
-  # checked before anything changes (qlp_sync_runtime_env checks them again).
+  # RAW_BIDIRECTIONAL, RAW_COLOR_CHECK, RAW_MEDIA_CHECK, STATUS_POLL_SECONDS, RAW_IDLE_TIMEOUT,
+  # MAX_JOB_BYTES: checked before anything changes (qlp_sync_runtime_env checks them again).
   qlp_validate_runtime_settings
   [[ "${USB_VENDOR_ID:-}" =~ ^[0-9A-Fa-f]{4}$ ]] || die "config: USB_VENDOR_ID='${USB_VENDOR_ID:-}' must be 4 hex digits"
   [[ -z "${USB_PRODUCT_ID:-}" || "$USB_PRODUCT_ID" =~ ^[0-9A-Fa-f]{4}$ ]] \

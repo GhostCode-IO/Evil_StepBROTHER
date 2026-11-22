@@ -19,15 +19,21 @@ Also recorded per paper: Brother DK part numbers known to report that size,
 the brother_ql label identifier (used by ``MEDIA_DEFAULT`` in the config), the
 inch designation from Brother's raster reference, and the roll code (status
 byte 14) where a printer has been seen reporting one.
+
+:func:`compare_media` holds the printer's own rule for a job's media (its
+``ESC i z``), used by ql810wc-proxyd's media check (``RAW_MEDIA_CHECK``).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 from .rasterproto import (
     MEDIA_CONTINUOUS,
     MEDIA_DIE_CUT,
+    PI_KIND,
+    PI_LENGTH,
+    PI_WIDTH,
     QL810W_MODEL_CODE,
     QL810W_SERIES_CODE,
     STATUS_HEADER,
@@ -36,7 +42,7 @@ from .rasterproto import (
     Status,
 )
 
-#: Length tolerance used by ``describe(..., exact=False)``.
+#: Length tolerance used by ``describe(..., exact=False)`` and :func:`compare_media`.
 LENGTH_TOLERANCE_MM = 1
 #: Byte 25 of a single-colour roll (bit 0 is set in every QL-800-series status block on record).
 TEXT_COLOR_SINGLE = 0x01
@@ -186,6 +192,76 @@ def dk_parts_for(status: Status) -> Tuple[str, ...]:
     by_code = ROLL_CODES.get(status.roll_code, ())
     narrowed = tuple(part for part in media.dk_parts if part in by_code)
     return narrowed or media.dk_parts
+
+
+#: The media fields of an ``ESC i z`` that :func:`compare_media` judges, in
+#: order, with the n1 flag that asks the printer to check each one.
+_REQUEST_FIELDS: Tuple[Tuple[str, int], ...] = (("type", PI_KIND), ("width", PI_WIDTH), ("length", PI_LENGTH))
+
+
+def describe_request(requested: Mapping[str, int]) -> str:
+    """The media an ``ESC i z`` asks for (rasterproto's ``requested_media``),
+    e.g. ``62 mm continuous tape`` or ``29x90 mm die-cut labels``.
+
+    Decided by the media type first, so that a refusal's text agrees with
+    the type :func:`compare_media` judged (``proxyd.describe_requested_media``
+    decides the same way): die-cut labels for type ``0x0B`` (``29 mm
+    die-cut labels`` without a length), continuous tape for type ``0x0A``
+    whatever the length, and for any other type die-cut labels when a
+    length is given. Missing keys count as 0."""
+    width, length = requested.get("width", 0), requested.get("length", 0)
+    kind = requested.get("type", 0)
+    if kind == MEDIA_DIE_CUT or (kind != MEDIA_CONTINUOUS and length):
+        return f"{width}x{length} mm die-cut labels" if length else f"{width} mm die-cut labels"
+    return f"{width} mm continuous tape"
+
+
+def compare_media(requested: Mapping[str, int], status: Status) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """The media fields of a job's ``ESC i z`` that differ from the loaded roll.
+
+    ``requested`` is rasterproto's ``requested_media`` (``flags``, ``type``,
+    ``width``, ``length``; missing keys count as 0). Returns ``(mismatched,
+    unchecked)``: the fields among ``"type"``, ``"width"`` and ``"length"``
+    (in that order) whose value differs from the roll in ``status``, split by
+    whether the job's n1 flags ask the printer to check them (``PI_KIND``,
+    ``PI_WIDTH``, ``PI_LENGTH``). Brother's raster reference: the printer
+    checks a field only when its flag is set, and reports "replace media"
+    (error information 2 bit 0) when it differs, so only ``mismatched``
+    fields make the printer reject the job.
+
+    The rule:
+
+    * nothing is judged (both empty) without a roll (:attr:`Status.has_media`)
+      or for a roll :func:`describe` does not know (``exact=False``);
+    * type: judged only when the job's type is exactly ``0x0A`` (continuous)
+      or ``0x0B`` (die-cut); compared with the roll's type (status byte 11,
+      low nibble);
+    * width: judged only when the job gives one (not 0); compared with status
+      byte 10;
+    * length: judged only on a die-cut roll; it differs when the job's length
+      is more than ``LENGTH_TOLERANCE_MM`` from status byte 17 (the printer's
+      rounded label length). Continuous tape takes any length, so on a
+      continuous roll no length is judged (the job's raster line count is
+      never a media property).
+    """
+    if not status.has_media or describe(status, exact=False) is None:
+        return (), ()
+    kind = requested.get("type", 0)
+    width = requested.get("width", 0)
+    length = requested.get("length", 0)
+    differs = {
+        "type": kind in (MEDIA_CONTINUOUS, MEDIA_DIE_CUT) and kind != status.media_type,
+        "width": width != 0 and width != status.media_width_mm,
+        "length": (status.media_type == MEDIA_DIE_CUT
+                   and abs(length - status.media_length_mm) > LENGTH_TOLERANCE_MM),
+    }
+    flags = requested.get("flags", 0)
+    mismatched: List[str] = []
+    unchecked: List[str] = []
+    for name, flag in _REQUEST_FIELDS:
+        if differs[name]:
+            (mismatched if flags & flag else unchecked).append(name)
+    return tuple(mismatched), tuple(unchecked)
 
 
 def mib_media_name(media: Optional[MediaInfo]) -> str:

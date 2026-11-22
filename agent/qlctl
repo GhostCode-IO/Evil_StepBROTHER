@@ -39,7 +39,7 @@ import time  # noqa: E402
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple  # noqa: E402
 
 from ql810wc import __version__, config, media, rasterproto, statecache, usbio  # noqa: E402
-from ql810wc.proxyd import format_peer, mask_serial  # noqa: E402
+from ql810wc.proxyd import describe_requested_media, format_peer, mask_serial  # noqa: E402
 from ql810wc.statecache import age_seconds, get_path  # noqa: E402
 
 UNIT = "ql810wc-proxyd.service"
@@ -157,8 +157,11 @@ def _print_status(doc: Mapping[str, Any], summary: Mapping[str, Any], path: str)
         print(f"Job       printing: from {job.get('peer')}, {job.get('bytes', 0)} bytes so far")
     elif job.get("last_result"):
         two = {True: "two-color", False: "mono"}.get(job.get("two_color"), "colour unknown")
+        # The media the job's first page asks for (its ESC i z), when the job had one.
+        requested = job.get("requested_media")
+        asked = f"{describe_requested_media(requested)}, " if isinstance(requested, dict) and requested else ""
         print(f"Job       last: {job['last_result']}, from {job.get('peer')}, {job.get('bytes', 0)} bytes, "
-              f"{two}, {_ago(age_seconds(doc, 'job.last_finished'))} ago")
+              f"{two}, {asked}{_ago(age_seconds(doc, 'job.last_finished'))} ago")
         if job.get("last_detail"):
             print(f"          {job['last_detail']}")
     else:
@@ -215,9 +218,10 @@ def _check_roll(frame: Optional[rasterproto.Status], two_color: bool,
         return ("a black/red roll (DK-22251) is loaded: a mono job puts the printer in an error that "
                 "only a power cycle clears. Use --two-color --pattern black for a black-only test")
     if width is not None and width != frame.media_width_mm:
-        # The job's ESC i z says which width it needs (its "width valid" flag is set).
-        return (f"the loaded roll is {frame.media_width_mm} mm wide but --width {width} was requested: "
-                "the printer rejects the job ('replace media') until the roll cover is opened and closed")
+        # The job's ESC i z says which width it needs (its "width valid" flag is set). Brother documents
+        # the rejection; the stop is what owners of the QL-800 and QL-810W report, hence "may".
+        return (f"the loaded roll is {frame.media_width_mm} mm wide but --width {width} was requested: the "
+                "printer rejects the job ('replace media') and may stop until someone clears it at the printer")
     return None
 
 
@@ -282,7 +286,7 @@ def cmd_test_print(args: argparse.Namespace, cfg: config.RuntimeConfig) -> int:
              f"within {args.timeout:.0f} s")
         return EXIT_FAIL
     except OSError as exc:
-        # ql810wc-proxyd records a job it refuses (RAW_COLOR_CHECK) before it resets the client.
+        # ql810wc-proxyd records a job it refuses (RAW_COLOR_CHECK, RAW_MEDIA_CHECK) before it resets the client.
         after = statecache.StateCache(path).read()
         finished = get_path(after, "job.last_finished")
         if (peer and get_path(after, "job.peer") == peer[0] and get_path(after, "job.last_result") == "refused"
@@ -436,7 +440,9 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--port", type=int, default=None, help="proxy port (default: RAW_PORT)")
     test.add_argument("--timeout", type=float, default=120.0,
                       help="seconds to wait for delivery (default: %(default)s)")
-    test.add_argument("--force", action="store_true", help="send even if the loaded roll does not match")
+    test.add_argument("--force", action="store_true",
+                      help="send even if the loaded roll does not match; ql810wc-proxyd's checks "
+                           "(RAW_COLOR_CHECK, RAW_MEDIA_CHECK) may still refuse the job")
     test.set_defaults(func=cmd_test_print, mono=False)
 
     probe = sub.add_parser("probe", help="read the printer status straight from USB")

@@ -14,24 +14,52 @@ connection goes through these states::
                            │            │                                     "receiving")
                            │            └── RST/error, RAW_IDLE_TIMEOUT or MAX_JOB_BYTES before
                            │                the 0x1A: torn, the printer gets 400 x NUL + ESC @
-                           └── colour mode the loaded roll cannot print: refused (RST);
+                           └── colour mode or media the loaded roll cannot take: refused (RST);
                                none of the job's print data reaches the printer
 
-* **CHECKING** (``RAW_COLOR_CHECK``, on by default) - a job's print data is
-  held back until it shows its colour mode (its ``ESC i K`` and first raster
-  row, normally within its first kilobyte). A black-only job while a
-  black/red roll is loaded, or a two-colour job while a single-colour roll is
-  loaded, is refused: the printer itself would reject it ("media does not
-  support monochrome printing", or "... two-color printing" per Brother's
-  SDK), and the tested unit, after a black-only job on DK-22251, answered no
-  status request until it was switched off and on. The client gets a reset
-  and the job is recorded as ``refused``. Whenever the job's colour mode or
-  the roll is not certain (no ``ESC i K``, a first raster row that
-  contradicts it, a stream the tokenizer cannot follow before the job shows
-  its mode, no mode within the first 256 KiB held (``_COLOR_HOLD_LIMIT``), no
-  status frame from the last ``STATUS_MAX_AGE_SECONDS`` even after asking for
-  one (none is asked for while the printer's input state is unknown), no
-  roll, an unknown byte 25), the job goes through unchecked.
+* **CHECKING** (``RAW_COLOR_CHECK`` and ``RAW_MEDIA_CHECK``, both on by
+  default) - a job's print data is held back until it shows its colour mode
+  and media (its ``ESC i K``, its ``ESC i z`` and its first raster row,
+  normally within its first kilobyte). The job is refused when the printer
+  itself would reject it for the loaded roll:
+
+  - the colour check: a black-only job while a black/red roll is loaded, or
+    a two-colour job while a single-colour roll is loaded ("media does not
+    support monochrome printing", or "... two-color printing" per Brother's
+    SDK). The tested unit, after a black-only job on DK-22251, answered no
+    status request until it was switched off and on.
+  - the media check: a media type (continuous or die-cut), width or die-cut
+    label length that the job's first page asks the printer to check (its
+    ``ESC i z`` flags) and the roll does not match, or a two-colour job in
+    high resolution mode on a black/red roll. Brother documents that the
+    printer rejects such a job (it reports a media mismatch as "replace
+    media", and it prints two colours in standard resolution only), and
+    owners of the QL-800 and QL-810W report that after "replace media" it
+    stops until someone opens and closes the roll cover. These rules are
+    judged only while the printer reports no fault: through a fault the
+    printer holds jobs (third-party reports) and presumably checks the roll
+    it has when it resumes.
+
+  A status read earlier that shows no roll or a fault is read again before
+  the job is judged: closing the roll cover sends no status, so a roll just
+  loaded shows only at the next poll.
+  A refusal judged on a status frame read earlier (an idle poll, say) is
+  confirmed first: the printer is asked once more, and its reply decides (it
+  may show another roll, no roll or a fault). A job is never delayed by two
+  status requests in one verdict: when the checks already asked during this
+  verdict (answered or not), no confirm read follows. A refused job's client
+  gets a reset, and the job is recorded as ``refused``.
+
+  Whenever the job's colour mode or media or the roll is not certain (no
+  ``ESC i K`` or ``ESC i z`` before the first raster row, a first raster row
+  that contradicts the ``ESC i K``, a stream the tokenizer cannot follow
+  before the job shows its mode, nothing shown within the first 256 KiB held
+  (``_CHECK_HOLD_LIMIT``), no status frame from the last
+  ``STATUS_MAX_AGE_SECONDS`` even after asking for one (none is asked for
+  while the printer's input state is unknown), no roll, an unknown roll or
+  byte 25), the job goes through unchecked. A job whose media differs from
+  the roll only in fields it does not ask the printer to check goes through
+  too, with a note in the journal.
 * **Before a job** - NULs and the set-up commands (``ESC @``, ``ESC i a 01``,
   ``ESC i !``) and ``ESC i S`` are no job: a read that holds nothing else is
   forwarded at once (iPrint&Label for iOS opens 402-byte connections that
@@ -40,12 +68,14 @@ connection goes through these states::
   that ends inside a command keeps that command back until it is complete,
   and a connection that ends first never sends it, so the printer never
   waits inside a command because of where a read ended. The same applies
-  after a settled job, to its trailer. With ``RAW_COLOR_CHECK`` on, the read
-  in which a job's print data starts is held whole with the job.
+  after a settled job, to its trailer. With ``RAW_COLOR_CHECK`` or
+  ``RAW_MEDIA_CHECK`` on, the read in which a job's print data starts is held
+  whole with the job.
 * **WRITING** - client bytes go to USB unmodified and in order. A
   :class:`~ql810wc.rasterproto.RasterTokenizer` watches them (job end,
   two-color bit, requested media) but never changes them; an opaque stream is
-  simply forwarded. The proxy never sends ``ESC i S`` while a job is in flight.
+  simply forwarded. The proxy never sends ``ESC i S`` while a job is in flight
+  (the checks ask only while all of the job is still held back).
 * **SETTLING** - after the job's ``0x1A`` the proxy reads the frames the
   printer volunteers and polls ``ESC i S`` until the phase is back at
   "receiving" (capped). Bytes the client sends meanwhile belong to that job:
@@ -69,8 +99,11 @@ connection goes through these states::
   of a command, once the job's print data is going to the printer, is reported
   as ``error`` and the printer is resynchronised too; with no job open, the
   incomplete command is simply not sent (no error, no resync).
-  A job that ends while it is still held back for the colour check sent no
-  print data to the printer, so there is nothing to resynchronise.
+  A job that ends while it is still held back for the checks sent no print
+  data to the printer, so there is nothing to resynchronise. That includes a
+  job torn because the printer took a status request of the checks only in
+  part: the job is never sent behind it, and the next status request
+  resynchronises the printer.
 
 Device lifecycle: the printer is found through sysfs (rescanned every few
 seconds while absent), opened through the kernel usblp node (pyusb as a
@@ -113,7 +146,10 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from . import __version__, media, statecache, usbio
 from . import config as qconfig
 from .rasterproto import (
+    EXPANDED_HIGH_RESOLUTION,
     INVALIDATE,
+    MEDIA_CONTINUOUS,
+    MEDIA_DIE_CUT,
     PHASE_PRINTING,
     PHASE_RECEIVING,
     PHASE_TYPES,
@@ -161,10 +197,11 @@ _COMMAND_MODE_RESTORE = 0xFF
 _LOG_REPEAT_SECONDS = 600.0
 #: Longest wait between reopen attempts of a printer that stopped answering.
 _MAX_REOPEN_BACKOFF = 60.0
-#: Most bytes of a job held back for the colour check. A job shows its colour
-#: mode within its first kilobyte or so (a few more with blank lines first);
-#: one that has not after this many bytes goes to the printer unchecked.
-_COLOR_HOLD_LIMIT = 256 * 1024
+#: Most bytes of a job held back for the checks (RAW_COLOR_CHECK, RAW_MEDIA_CHECK).
+#: A job shows its colour mode and media within its first kilobyte or so (a few
+#: more with blank lines first); one that has not after this many bytes goes to
+#: the printer unchecked.
+_CHECK_HOLD_LIMIT = 256 * 1024
 _JOURNAL_PRIORITY = {logging.DEBUG: 7, logging.INFO: 6, logging.WARNING: 4,
                      logging.ERROR: 3, logging.CRITICAL: 2}
 
@@ -190,6 +227,7 @@ class ProxySettings:
     raw_idle_timeout: float = float(DEFAULT_RAW_IDLE_TIMEOUT)
     max_job_bytes: int = DEFAULT_MAX_JOB_BYTES
     color_check: bool = True                 # RAW_COLOR_CHECK: refuse jobs the loaded roll cannot print
+    media_check: bool = True                 # RAW_MEDIA_CHECK: refuse jobs for other media than the roll
     status_max_age: float = 60.0             # STATUS_MAX_AGE_SECONDS: older status is not trusted
     post_job_timeout: float = 60.0           # longest wait for the printer after a job
     post_job_poll: float = 1.0               # ESC i S cadence while settling
@@ -219,9 +257,10 @@ class ProxySettings:
 
         Also reads ``RAW_IDLE_TIMEOUT`` (seconds, 10-86400, default 300),
         ``MAX_JOB_BYTES`` (64 KiB - 1 GiB, default 16 MiB), ``RAW_COLOR_CHECK``
-        (default yes) and ``STATUS_MAX_AGE_SECONDS`` (how old a status frame
-        the colour check trusts). ``listen`` overrides ``RAW_BIND``/``RAW_PORT``.
-        Raises ``config.ConfigError``.
+        and ``RAW_MEDIA_CHECK`` (both default yes) and
+        ``STATUS_MAX_AGE_SECONDS`` (how old a status frame the checks trust).
+        ``listen`` overrides ``RAW_BIND``/``RAW_PORT``. Raises
+        ``config.ConfigError``.
         """
         if device != "auto" and not device.startswith("/"):
             raise qconfig.ConfigError(f"device {device!r}: use 'auto' or an absolute path such as /dev/usb/lp0")
@@ -240,6 +279,7 @@ class ProxySettings:
             raw_idle_timeout=float(idle),
             max_job_bytes=max_bytes,
             color_check=qconfig.get_bool(cfg, "RAW_COLOR_CHECK"),
+            media_check=qconfig.get_bool(cfg, "RAW_MEDIA_CHECK"),
             status_max_age=float(qconfig.get_int(cfg, "STATUS_MAX_AGE_SECONDS")),
             write_stall_timeout=float(idle),
             heartbeat_seconds=float(min(30, poll)),
@@ -467,6 +507,94 @@ def media_summary(frame: Optional[Status]) -> Optional[Dict[str, Any]]:
                                f"0x{frame.media_type_raw:02x}, length {frame.media_length_mm} mm)"}
     return {"label_id": found.label_id, "name": found.name, "two_color": found.needs_two_color,
             "dk_parts": list(media.dk_parts_for(frame)), "description": found.description}
+
+
+def _roll_two_color(frame: Status) -> Optional[bool]:
+    """The loaded roll's colours as the checks see them (status byte 25): True
+    for a black/red roll (``0x81``), False for a single-colour roll
+    (``0x01``), None for any other value."""
+    if frame.text_color == TEXT_COLOR_BLACK_RED:
+        return True
+    if frame.text_color == media.TEXT_COLOR_SINGLE:
+        return False
+    return None
+
+
+def _judged_roll(frame: Status) -> str:
+    """The loaded roll as the media rules judged it, for their texts: P-touch's
+    name for it (:func:`media_summary`), or, for a roll only the lenient
+    lookup knows (``media.describe(exact=False)``, the one
+    ``media.compare_media`` judges by), that lookup's name. A 60x86 roll
+    that reports a label length of 86 is "60mm x 86mm die-cut (DK-11234)",
+    not an unsupported roll."""
+    found = media_summary(frame)
+    if found is not None and found["label_id"] is not None:
+        return str(found["description"])
+    lenient = media.describe(frame, exact=False)
+    if lenient is not None:
+        return lenient.description
+    return str(found["description"]) if found else "an unknown roll"
+
+
+def _refusal_detail(frame: Status, wants_two: Optional[bool], requested: Optional[Mapping[str, int]],
+                    high_res: bool) -> Tuple[str, Tuple[str, ...]]:
+    """Why the checks refuse a job for the roll in ``frame``.
+
+    ``wants_two``: the job's colour mode (None: not judged, as without the
+    colour check); ``requested``: what the job's first page asks for (its
+    ``ESC i z``; None: not judged); ``high_res``: a two-colour job in high
+    resolution mode (False: not judged). Returns ``(detail, unchecked)``:
+    ``detail`` is the refusal text, "" when ``frame`` warrants none (it has
+    no roll, or no rule fails); ``unchecked`` lists the media fields that
+    differ from the roll but that the job does not ask the printer to check
+    (see ``media.compare_media``).
+
+    The colour rule is judged whatever else the printer reports. The media
+    rules (size and high resolution) are judged only while it reports no
+    fault: through a fault (cover open, no or end of media, any error) the
+    printer holds jobs (third-party reports) and presumably checks the roll
+    it has when it resumes.
+
+    The texts name the roll as P-touch would (:func:`media_summary`); a size
+    mismatch names it as the media rules judged it (:func:`_judged_roll`)."""
+    if not frame.has_media:
+        return "", ()
+    roll_two = _roll_two_color(frame)
+    color = wants_two is not None and roll_two is not None and wants_two != roll_two
+    mismatched: Tuple[str, ...] = ()
+    unchecked: Tuple[str, ...] = ()
+    high = False
+    if not frame.is_error:
+        if requested is not None:
+            mismatched, unchecked = media.compare_media(requested, frame)
+        high = high_res and roll_two is True
+    if not (color or mismatched or high):
+        return "", unchecked
+    problems: List[str] = []
+    if color:
+        problems.append("takes two-color jobs only" if roll_two else "cannot print red")
+    if high:
+        problems.append("prints two colors in standard resolution only")
+    if color and roll_two:
+        subject = "a black-only job"
+    elif color or high:
+        subject = "a two-color job"
+    else:
+        subject = "a job"
+    if mismatched:
+        assert requested is not None
+        subject += f" for {media.describe_request(requested)}"
+    if high:
+        subject += " in high resolution mode"
+    if mismatched:
+        detail = f"{subject}, but the loaded roll is {_judged_roll(frame)}"
+        if problems:
+            detail += f", which {' and '.join(problems)}"
+    else:
+        found = media_summary(frame)
+        roll = str(found["description"]) if found else "an unknown roll"
+        detail = f"{subject}, but the loaded roll, {roll}, {' and '.join(problems)}"
+    return detail, unchecked
 
 
 # ---------------------------------------------------------------------------
@@ -797,7 +925,11 @@ def _identity(info: Optional[PrinterInfo]) -> Tuple[Any, ...]:
 class JobRecord:
     """One print job, from its first command to the printer being back at
     "receiving". ``bytes`` counts the job's data; bytes that followed its
-    ``0x1A`` on the same connection (P-touch's trailer) are ``trailer_bytes``."""
+    ``0x1A`` on the same connection (P-touch's trailer) are ``trailer_bytes``.
+    ``requested_media`` and ``expanded_mode`` are what the job's first page
+    asks for (its ``ESC i z`` and ``ESC i K``, as rasterproto's
+    ``decided_media`` / ``decided_expanded_mode``), else the last ones seen;
+    ``expanded_mode`` is not published in state.json."""
 
     peer: str
     started: float                           # wall clock
@@ -806,6 +938,7 @@ class JobRecord:
     trailer_bytes: int = 0
     two_color: Optional[bool] = None
     requested_media: Optional[Dict[str, int]] = None
+    expanded_mode: Optional[int] = None
     pages: int = 0
     opaque: Optional[str] = None
     printing_seen: bool = False              # a frame showed the printing phase
@@ -824,6 +957,7 @@ class JobRecord:
             parts.append("two-color" if self.two_color else "black only")
         if self.requested_media:
             parts.append(describe_requested_media(self.requested_media))
+            parts.append(describe_print_header(self.requested_media, self.expanded_mode))
         if self.trailer_bytes:
             parts.append(f"{self.trailer_bytes}-byte trailer")
         if self.opaque:
@@ -833,11 +967,31 @@ class JobRecord:
 
 
 def describe_requested_media(requested: Mapping[str, int]) -> str:
-    """``ESC i z`` contents as text, e.g. ``requested 62 mm continuous``."""
+    """``ESC i z`` contents as text, e.g. ``requested 62 mm continuous``.
+
+    Decided by the media type first, as ``media.describe_request`` does:
+    die-cut for type ``0x0B`` (``requested 29x90 mm die-cut``, or without a
+    length ``requested 29 mm die-cut``), continuous for type ``0x0A`` whatever
+    the length, and for any other type die-cut when a length is given.
+    Missing keys count as 0."""
     width, length = requested.get("width", 0), requested.get("length", 0)
-    if requested.get("type") == 0x0B or length:
-        return f"requested {width}x{length} mm die-cut"
+    kind = requested.get("type", 0)
+    if kind == MEDIA_DIE_CUT or (kind != MEDIA_CONTINUOUS and length):
+        return f"requested {width}x{length} mm die-cut" if length else f"requested {width} mm die-cut"
     return f"requested {width} mm continuous"
+
+
+def describe_print_header(requested: Mapping[str, int], expanded_mode: Optional[int] = None) -> str:
+    """The rest of an ``ESC i z`` as text, e.g. ``748 lines (63.3 mm of print),
+    flags 0x8e``: its raster line count (n5-n8; left out when 0) as a length
+    at 300 dpi, or 600 dpi when ``expanded_mode`` (``ESC i K``) asks for high
+    resolution, and its n1 flags."""
+    lines = requested.get("lines", 0)
+    flags = f"flags 0x{requested.get('flags', 0) & 0xFF:02x}"
+    if not lines:
+        return flags
+    dpi = 600 if expanded_mode is not None and expanded_mode & EXPANDED_HIGH_RESOLUTION else 300
+    return f"{lines} lines ({lines * 25.4 / dpi:.1f} mm of print), {flags}"
 
 
 class _Abort(Exception):
@@ -857,8 +1011,9 @@ class _Segment:
         self.bytes = 0
         self.job: Optional[JobRecord] = None
         self.after_job = after_job
-        #: The job's bytes held back while the colour check waits for its colour
-        #: mode (None when nothing is held: no job yet, or the check is done or off).
+        #: The job's bytes held back while the checks (RAW_COLOR_CHECK, RAW_MEDIA_CHECK)
+        #: wait for its colour mode and media (None when nothing is held: no job yet, or
+        #: the checks are done or off).
         self.withheld: Optional[bytearray] = None
         #: While no job has started: the bytes of a command a read ended in, kept
         #: back until the command is complete (rasterproto ``partial_command``).
@@ -1040,7 +1195,9 @@ class ProxyDaemon:
         addresses = ", ".join(format_peer(s.getsockname()) for s in self.listeners)
         log.info("ql810wc-proxyd %s listening on %s", __version__, addresses)
         if not self.settings.color_check:
-            log.warning("RAW_COLOR_CHECK is off: every job goes to the printer unchecked")
+            log.warning("RAW_COLOR_CHECK is off: jobs go to the printer without the colour check")
+        if not self.settings.media_check:
+            log.warning("RAW_MEDIA_CHECK is off: jobs go to the printer without the media check")
         try:
             # The first device scan comes before the first state.json and READY=1, so
             # neither reports a printer that is attached as absent.
@@ -1304,12 +1461,15 @@ class ProxyDaemon:
         finally:
             self._session = None
             sess.close(abort=True)          # no-op unless something went badly wrong
-            self._next_poll = _mono() + self.settings.poll_seconds
+            # After an abort that leaves the printer's input state unknown (a torn write,
+            # a status request of the checks taken only in part), the next idle poll
+            # resynchronises it before another queued connection is served.
+            self._next_poll = _mono() if self.link.unknown else _mono() + self.settings.poll_seconds
 
     def _refuse(self, sock: socket.socket, peer: str) -> None:
         """Turn a connection away while the printer is unusable: the client sees
         a reset at once, and state.json records the job as an error (nothing
-        reached the printer; ``refused`` is the colour check's result)."""
+        reached the printer; ``refused`` is the checks' result)."""
         reason = f"printer not available: {self._status_text()}"
         log.warning("turned away a print job from %s (%s)", peer, reason)
         _close_socket(sock, abort=True)
@@ -1364,7 +1524,7 @@ class ProxyDaemon:
                 if seg.job is None and seg.has_job_content():
                     seg.job = self._begin_job(sess, seg, carried=len(carried))
                     jobs.append(seg.job)
-                    if self.settings.color_check:
+                    if self.settings.color_check or self.settings.media_check:
                         seg.withheld = bytearray()
                 elif seg.job is None:
                     # No job yet. A read that ends inside a command keeps that command back
@@ -1375,10 +1535,12 @@ class ProxyDaemon:
                         seg.pending = tail
                         chunk = chunk[:-len(tail)]
                 if seg.withheld is not None:
-                    # The colour check: the job waits here until it shows its colour mode.
+                    # The checks: the job waits here until it shows its colour mode and media.
+                    # Nothing of it is released before the verdict, and never behind a status
+                    # request of the checks that the printer took only in part (_check_request).
                     seg.withheld += chunk
                     self._account(seg, consumed)
-                    verdict = self._color_verdict(seg, final=ended or len(seg.withheld) >= _COLOR_HOLD_LIMIT)
+                    verdict = self._job_verdict(seg, final=ended or len(seg.withheld) >= _CHECK_HOLD_LIMIT)
                     if verdict is None:
                         continue
                     refuse, detail = verdict
@@ -1445,63 +1607,138 @@ class ProxyDaemon:
         self._notify_status()
         return job
 
-    def _color_verdict(self, seg: _Segment, final: bool) -> Optional[Tuple[bool, str]]:
-        """``RAW_COLOR_CHECK``: may the job held in ``seg.withheld`` go to the printer?
+    def _job_verdict(self, seg: _Segment, final: bool) -> Optional[Tuple[bool, str]]:
+        """``RAW_COLOR_CHECK`` and ``RAW_MEDIA_CHECK``: may the job held in
+        ``seg.withheld`` go to the printer?
 
         None while the job has not shown its colour mode yet (unless ``final``);
-        else ``(refuse, detail)``. A job is refused only when it clearly asks
-        for a colour mode the loaded roll cannot print, the same check the
-        printer makes: the tokenizer knows the job's mode (its ``ESC i K``, in
-        agreement with its first raster row) and a recent status frame shows a
-        black/red roll (byte 25 ``0x81``) or a single-colour roll (``0x01``).
-        A mode decided before the stream turned opaque still counts, so the
-        verdict does not depend on how the job was split into reads. Anything
-        less certain goes through unchecked."""
+        else ``(refuse, detail)``. The verdict comes at the job's first raster
+        row (or, without one, its first print command), from what its first
+        page asks for there: its colour mode (its ``ESC i K``, in agreement
+        with that row), its media (its ``ESC i z``) and whether it asks for
+        two colours in high resolution. A mode decided before the stream
+        turned opaque still counts, so the verdict does not depend on how the
+        job was split into reads.
+
+        A job is refused only when the printer itself would reject it for the
+        loaded roll, judged on a recent status frame (see
+        :func:`_refusal_detail` and :meth:`_check_frame`): a colour mode the
+        roll cannot print, a media field the job asks the printer to check
+        that the roll does not match, or two colours in high resolution on a
+        black/red roll. A status read earlier that shows no roll or a fault
+        is read again before the job is judged: closing the roll cover sends
+        no status, so a roll just loaded shows only at the next poll. A
+        refusal judged on a frame read
+        before this verdict (an idle poll) is confirmed first: the printer is
+        asked once more, and its reply decides, whatever it shows; without a
+        reply the earlier frame stands. A job is never delayed by two status
+        requests in one verdict: when the checks already asked during this
+        verdict (answered or not), no confirm read follows. Anything less
+        certain goes through unchecked. A job that passes although its media
+        differs from the roll in fields it does not ask the printer to check
+        is noted in the journal."""
         tok = seg.tok
         if not tok.color_decided:
             # An opaque stream never shows its mode; otherwise wait (up to the hold limit).
             return (False, "") if final or tok.opaque is not None else None
-        wants_two = tok.requested_two_color
-        if wants_two is None:
+        s = self.settings
+        wants_two = tok.requested_two_color if s.color_check else None
+        requested = tok.decided_media if s.media_check else None
+        high_res = bool(s.media_check and tok.requested_two_color is True
+                        and tok.decided_expanded_mode is not None
+                        and tok.decided_expanded_mode & EXPANDED_HIGH_RESOLUTION)
+        if wants_two is None and requested is None and not high_res:
+            return False, ""                  # nothing to judge: no status request
+        frame, asked = self._check_frame()
+        if frame is None:
             return False, ""
-        roll_two, roll = self._loaded_roll()
-        if roll_two is None or wants_two == roll_two:
-            return False, ""
-        if roll_two:
-            return True, f"a black-only job, but the loaded roll, {roll}, takes two-color jobs only"
-        return True, f"a two-color job, but the loaded roll, {roll}, cannot print red"
+        detail, unchecked = _refusal_detail(frame, wants_two, requested, high_res)
+        if detail and not asked:
+            # The frame was read before this verdict (an idle poll, say): the roll may have
+            # changed since. The printer's reply decides, whatever it shows. (When the checks
+            # asked already during this verdict, answered or not, they do not ask again.)
+            reply = self._confirm_frame()
+            if reply is not None:
+                frame = reply
+                detail, unchecked = _refusal_detail(reply, wants_two, requested, high_res)
+        if detail:
+            return True, detail
+        if unchecked and requested is not None:
+            peer = seg.job.peer if seg.job is not None else "an unknown client"
+            log.info("a job from %s for %s goes to the printer unchecked: the loaded roll is %s, but the job "
+                     "does not ask the printer to check its %s", peer, media.describe_request(requested),
+                     _judged_roll(frame), " or ".join(unchecked))
+        return False, ""
 
-    def _loaded_roll(self) -> Tuple[Optional[bool], str]:
-        """The loaded roll as the colour check sees it: (two-colour, description).
+    def _check_frame(self) -> Tuple[Optional[Status], bool]:
+        """The status frame the checks judge the loaded roll by, and whether
+        they asked the printer for it during this verdict: ``(frame, asked)``.
 
-        True for a black/red roll (status byte 25 ``0x81``), False for a
-        single-colour roll (``0x01``), from a status frame read in the last
-        ``status_max_age`` seconds. Without one (the idle polls pause while
-        set-up commands wait on a connection) it asks the printer once, unless
-        the printer's input state is unknown (a resync pending): none of the
-        held job has reached it, so a printer in a known state stands between
-        commands. None
-        without such a frame, without a roll (cover open with the roll taken
-        out), or for any other byte-25 value."""
+        The printer is asked once (:meth:`_check_request`) when the last
+        frame is older than ``status_max_age`` seconds (the idle polls pause
+        while set-up commands wait on a connection), shows no roll, or shows
+        a fault: a roll swap passes through both (cover open, roll out), and
+        closing the roll cover sends no status, so a roll just loaded shows
+        only at the next poll. That holds for the colour rule too, which
+        judges a frame with a fault: a single-colour roll seen with the cover
+        open may be DK-22251 by now. It is not asked while its input state
+        is unknown (a resync pending). ``asked`` is True when the checks
+        asked, answered or not; a refusal is then not confirmed again
+        (:meth:`_job_verdict`).
+
+        The frame is the reply, or without one the last frame. It is None
+        when that is older than ``status_max_age`` seconds or shows no roll
+        (cover open with the roll taken out): the job then goes through
+        unchecked. A reply that still shows the fault lets the media rules
+        pass (:func:`_refusal_detail`)."""
         link = self.link
         if not link.ready:
-            return None, ""
-        if self._status_stale() and not link.unknown:
-            try:
-                link.request(resync=False)
-            except UsbError as exc:
-                log.debug("status request for the colour check: %s", exc)
+            return None, False
+        asked = False
+        last = link.last_frame
+        if not link.unknown and (self._status_stale() or last is None or not last.has_media
+                                 or last.is_error):
+            asked = True
+            self._check_request()
         frame = link.last_frame
         if frame is None or not link.ready or not frame.has_media or self._status_stale():
-            return None, ""
-        if frame.text_color == TEXT_COLOR_BLACK_RED:
-            two = True
-        elif frame.text_color == media.TEXT_COLOR_SINGLE:
-            two = False
-        else:
-            return None, ""
-        found = media_summary(frame)
-        return two, str(found["description"]) if found else "an unknown roll"
+            return None, asked
+        return frame, asked
+
+    def _check_request(self) -> bool:
+        """One ``ESC i S`` for the checks, while the job is held: none of it has
+        reached the printer, so a printer in a known state stands between
+        commands. True when the printer answered (its reply is then
+        ``link.last_frame``); False when it did not and the stream is still
+        at a command boundary.
+
+        Raises :class:`_Abort` when the job must not follow the request: the
+        printer went away, or it took the request only in part (it may wait
+        inside that command; the job is then torn without any of it sent, and
+        the next status request resynchronises the printer)."""
+        link = self.link
+        try:
+            link.request(resync=False)
+        except UsbError as exc:
+            log.debug("status request for the checks: %s", exc)
+            if not link.ready:
+                raise _Abort("device", f"the printer is not available ({link.detail})") from None
+            if link.unknown:
+                raise _Abort("usb", "the printer took the check's status request only in part") from None
+            return False
+        return True
+
+    def _confirm_frame(self) -> Optional[Status]:
+        """Before a refusal judged on an earlier frame (the checks did not ask
+        during this verdict): ask the printer once more. Returns its reply, or
+        None without one (the printer's input state is unknown, or it did not
+        answer)."""
+        link = self.link
+        if not link.ready or link.unknown:
+            return None
+        if not self._check_request():
+            return None
+        return link.last_frame
 
     def _status_stale(self) -> bool:
         """No status frame was read in the last ``status_max_age`` seconds."""
@@ -1519,8 +1756,14 @@ class ProxyDaemon:
         job.bytes += count
         if tok.expanded_mode is not None:
             job.two_color = tok.two_color
-        if tok.requested_media is not None:
-            job.requested_media = dict(tok.requested_media)
+        # What the job's first page asks for, once known (a multi-page job read at once
+        # has its last page's header in requested_media); before that, the last one seen.
+        requested = tok.decided_media if tok.decided_media is not None else tok.requested_media
+        if requested is not None:
+            job.requested_media = dict(requested)
+        mode = tok.decided_expanded_mode if tok.decided_expanded_mode is not None else tok.expanded_mode
+        if mode is not None:
+            job.expanded_mode = mode
         job.pages = tok.pages
         job.opaque = tok.opaque
         self._publish_job(job)
@@ -1767,8 +2010,9 @@ class ProxyDaemon:
         """The connection ended before this job's 0x1A was forwarded and settled."""
         kind = abort.kind if abort is not None else None
         if kind == "refused":
-            # The colour check: none of the job's print data reached the printer. The result
-            # is recorded before the client is reset, which is all it learns over raw TCP.
+            # The checks (RAW_COLOR_CHECK, RAW_MEDIA_CHECK): none of the job's print data reached
+            # the printer. The result is recorded before the client is reset, which is all it
+            # learns over raw TCP.
             assert abort is not None
             seg.withheld = None
             log.warning("refused a print job from %s: %s. None of its print data was sent to the printer",
@@ -1777,8 +2021,10 @@ class ProxyDaemon:
             sess.close(abort=True)
             return
         if seg.withheld is not None:
-            # Still held back for the colour check: none of the job's print data reached
-            # the printer, which stands between commands; there is nothing to resynchronise.
+            # Still held back for the checks: none of the job's print data reached the printer,
+            # so there is nothing to resynchronise for it. A status request of the checks that
+            # the printer took only in part ends the job here too (torn); it left the link's
+            # input state unknown, so the next status request resynchronises the printer.
             seg.withheld = None
             reason = abort.detail if abort is not None else sess.error
             if reason is not None:
@@ -1959,7 +2205,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 __all__ = [
     "DEFAULT_MAX_JOB_BYTES", "DEFAULT_RAW_IDLE_TIMEOUT", "EX_CONFIG", "EX_OK", "EX_OSERR", "EX_SOFTWARE",
     "EX_USAGE", "MIN_MAX_JOB_BYTES", "JobRecord", "PrinterLink", "ProxyDaemon", "ProxySettings",
-    "SdNotifier", "UsbProvider", "bind_listener", "build_parser", "describe_requested_media",
-    "format_peer", "main", "mask_serial", "media_summary", "parse_listen", "setup_logging",
-    "systemd_listeners",
+    "SdNotifier", "UsbProvider", "bind_listener", "build_parser", "describe_print_header",
+    "describe_requested_media", "format_peer", "main", "mask_serial", "media_summary", "parse_listen",
+    "setup_logging", "systemd_listeners",
 ]

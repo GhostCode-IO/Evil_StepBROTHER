@@ -196,6 +196,163 @@ class SynthesizeTest(unittest.TestCase):
         self.assertEqual(s.model_name, "QL-800")
 
 
+def req(flags: int, kind: int, width: int, length: int = 0) -> dict:
+    """A job's ``ESC i z`` as rasterproto's ``requested_media`` has it."""
+    return {"flags": flags, "type": kind, "width": width, "length": length, "lines": 748, "page": 0}
+
+
+#: ESC i z parameters (hex) as Brother's macOS driver 4.0.3 sends them on a network queue (local renders).
+MAC_HEADERS = {
+    '2.4"': "8E 0A 3E 00 57 04 00 00 00 00",                       # 62 mm continuous, 1111 lines
+    'Length 69.1 mm': "8E 0A 3E 00 EC 02 00 00 00 00",             # 62 mm continuous, 748 lines
+    '1.1" x 3.5" (DC03)': "8E 0B 1D 5A DF 03 00 00 00 00",         # 29x90 die-cut
+    '2.4" x 1.1" (DC06)': "8E 0B 3E 1D 0F 01 00 00 00 00",         # 62x29 die-cut
+    '1.1"': "8E 0A 1D 00 57 04 00 00 00 00",                       # 29 mm continuous
+    '2-Color + High resolution': "CE 0A 3E 00 AF 08 00 00 00 00",  # 62 mm continuous, 600 dpi lines
+}
+
+
+class CompareMediaTest(unittest.TestCase):
+    """compare_media: the printer's own check of a job's ``ESC i z`` against the
+    loaded roll (Brother's raster reference), which RAW_MEDIA_CHECK applies."""
+
+    DK22251 = st(REF_DK22251_IDLE)                                   # 62 mm continuous, black/red
+    DK11201 = st(REF_DK11201_IDLE)                                   # 29x90 die-cut
+    DK11202 = media.synthesize_status(media.lookup_label("62x100"))  # 62x100 die-cut
+
+    def test_flags_constants(self):
+        self.assertEqual((rp.PI_KIND, rp.PI_WIDTH, rp.PI_LENGTH), (0x02, 0x04, 0x08))
+        self.assertEqual(media.LENGTH_TOLERANCE_MM, 1)
+
+    def test_rules(self):
+        dk22251, dk11201, dk11202 = self.DK22251, self.DK11201, self.DK11202
+        cases = [
+            # A field differs: checked (its n1 flag is set) or not.
+            ("the roll's own tape", dk22251, req(0x86, 0x0A, 62), ((), ())),
+            ("the roll's own tape, length flagged", dk22251, req(0x8E, 0x0A, 62), ((), ())),
+            ("die-cut labels on continuous tape", dk22251, req(0x8E, 0x0B, 29, 90), (("type", "width"), ())),
+            ("62x29 die-cut on 62 mm tape", dk22251, req(0x8E, 0x0B, 62, 29), (("type",), ())),
+            ("another width", dk22251, req(0x86, 0x0A, 29), (("width",), ())),
+            ("flags 0x80", dk22251, req(0x80, 0x0B, 29, 90), ((), ("type", "width"))),
+            ("no flags", dk22251, req(0x00, 0x0B, 29, 90), ((), ("type", "width"))),
+            ("type flagged, width not", dk22251, req(0x82, 0x0B, 29, 90), (("type",), ("width",))),
+            ("width flagged, type not", dk22251, req(0x84, 0x0B, 29, 90), (("width",), ("type",))),
+            ("quality and recovery bits", dk22251, req(0xC0, 0x0A, 29), ((), ("width",))),
+            ("continuous tape on die-cut labels", dk11202, req(0x86, 0x0A, 62), (("type",), ("length",))),
+            ("the same, length flagged", dk11202, req(0x8E, 0x0A, 62), (("type", "length"), ())),
+            ("everything differs", dk11201, req(0x8E, 0x0A, 62), (("type", "width", "length"), ())),
+            # Lengths: die-cut rolls only, within LENGTH_TOLERANCE_MM of byte 17.
+            ("the roll's own labels", dk11201, req(0x8E, 0x0B, 29, 90), ((), ())),
+            ("1 mm shorter", dk11201, req(0x8E, 0x0B, 29, 89), ((), ())),
+            ("1 mm longer", dk11201, req(0x8E, 0x0B, 29, 91), ((), ())),
+            ("2 mm shorter", dk11201, req(0x8E, 0x0B, 29, 88), (("length",), ())),
+            ("2 mm longer", dk11201, req(0x8E, 0x0B, 29, 92), (("length",), ())),
+            ("2 mm shorter, length not flagged", dk11201, req(0x86, 0x0B, 29, 88), ((), ("length",))),
+            ("60x86 on a roll that reads 87", frame(60, 0x0B, 87), req(0x8E, 0x0B, 60, 86), ((), ())),
+            ("62x60 on a roll that reads 61", frame(62, 0x0B, 61), req(0x8E, 0x0B, 62, 60), ((), ())),
+            ("continuous tape takes any length", dk22251, req(0x8E, 0x0A, 62, 100), ((), ())),
+            ("a length on continuous tape, no type", dk22251, req(0x8E, 0x00, 62, 100), ((), ())),
+            # Values the rule does not judge.
+            ("type 0x4A", dk22251, req(0x8E, 0x4A, 62), ((), ())),
+            ("type 0x4B", dk11201, req(0x8E, 0x4B, 29, 90), ((), ())),
+            ("type 0", dk22251, req(0x8E, 0x00, 62), ((), ())),
+            ("width 0", dk22251, req(0x8E, 0x0A, 0), ((), ())),
+            ("width 0 on die-cut labels", dk11201, req(0x86, 0x0B, 0, 90), ((), ())),
+            # The roll's media type is its byte 11 low nibble (the manual's 0x4B reads as 0x0B).
+            ("a roll that reports 0x4B", frame(29, 0x4B, 90), req(0x8E, 0x0B, 29, 90), ((), ())),
+            ("a roll that reports 0x4B, a tape job", frame(29, 0x4B, 90), req(0x86, 0x0A, 29),
+             (("type",), ("length",))),
+        ]
+        for name, roll, requested, expected in cases:
+            with self.subTest(name):
+                before = dict(requested)
+                self.assertEqual(media.compare_media(requested, roll), expected)
+                self.assertEqual(requested, before, "the request is not changed")
+
+    def test_no_or_unknown_roll_is_not_judged(self):
+        die_cut = req(0x8E, 0x0B, 29, 90)
+        rolls = {
+            "roll removed": st(REF_ROLL_REMOVED),
+            "roll removed, stale bytes": st(REF_ROLL_REMOVED_STALE),
+            "err1 no media": self.DK22251.with_overrides(err1=0x01),
+            "a width no paper has": frame(61, 0x0A, 0),
+            "a die-cut size no paper has": frame(62, 0x0B, 45),
+            "an unknown media type": frame(62, 0x0F, 0),
+        }
+        for name, roll in rolls.items():
+            with self.subTest(name):
+                self.assertEqual(media.compare_media(die_cut, roll), ((), ()))
+                self.assertEqual(media.compare_media(req(0x00, 0x0B, 29, 90), roll), ((), ()))
+
+    def test_faults_do_not_change_the_comparison(self):
+        # Pure: proxyd decides whether to judge while the printer reports a fault.
+        cover_open = st(REF_DK11201_COVER_OPEN)
+        self.assertTrue(cover_open.is_error)
+        self.assertEqual(media.compare_media(req(0x86, 0x0A, 62), cover_open), (("type", "width"), ("length",)))
+        self.assertEqual(media.compare_media(req(0x8E, 0x0B, 29, 90), cover_open), ((), ()))
+
+    def test_missing_keys_count_as_0(self):
+        self.assertEqual(media.compare_media({}, self.DK22251), ((), ()))
+        self.assertEqual(media.compare_media({"width": 29}, self.DK22251), ((), ("width",)))
+        self.assertEqual(media.compare_media({"flags": 0x8E}, self.DK11201), (("length",), ()))
+        self.assertEqual(media.compare_media({"flags": 0x8E, "type": 0x0B, "width": 29}, self.DK11201),
+                         (("length",), ()))
+
+    def test_mac_driver_headers(self):
+        """The headers as the tokenizer reads them from the wire."""
+        expected = {
+            '2.4"': ((), ()),
+            'Length 69.1 mm': ((), ()),
+            '1.1" x 3.5" (DC03)': (("type", "width"), ()),
+            '2.4" x 1.1" (DC06)': (("type",), ()),
+            '1.1"': (("width",), ()),
+            '2-Color + High resolution': ((), ()),
+        }
+        self.assertEqual(set(expected), set(MAC_HEADERS))
+        for name, params in MAC_HEADERS.items():
+            with self.subTest(name):
+                tok = rp.RasterTokenizer()
+                tok.feed(b"\x1b\x69\x7a" + bytes.fromhex(params))
+                self.assertEqual(media.compare_media(tok.requested_media, self.DK22251), expected[name])
+        tok = rp.RasterTokenizer()
+        tok.feed(b"\x1b\x69\x7a" + bytes.fromhex(MAC_HEADERS['1.1" x 3.5" (DC03)']))
+        self.assertEqual(media.compare_media(tok.requested_media, self.DK11201), ((), ()),
+                         "the queue's default paper on its own roll")
+
+
+class DescribeRequestTest(unittest.TestCase):
+    def test_texts(self):
+        # The media type decides first (the type compare_media judges); a length decides
+        # only for other types.
+        cases = [
+            (req(0x86, 0x0A, 62), "62 mm continuous tape"),
+            (req(0x8E, 0x0B, 29, 90), "29x90 mm die-cut labels"),
+            (req(0x8E, 0x0B, 62, 29), "62x29 mm die-cut labels"),
+            (req(0x8E, 0x0A, 62, 100), "62 mm continuous tape"),        # the type says tape
+            (req(0x8E, 0x0B, 29, 0), "29 mm die-cut labels"),           # the type says labels
+            (req(0x8E, 0x4A, 29), "29 mm continuous tape"),
+            (req(0x8E, 0x4B, 29, 90), "29x90 mm die-cut labels"),       # another type: a length means labels
+            (req(0x8E, 0x00, 62, 100), "62x100 mm die-cut labels"),
+            ({"type": 0x0B, "width": 29, "length": 90}, "29x90 mm die-cut labels"),
+            ({"width": 29, "length": 90}, "29x90 mm die-cut labels"),
+            ({"width": 29}, "29 mm continuous tape"),
+            ({}, "0 mm continuous tape"),
+        ]
+        for requested, text in cases:
+            with self.subTest(text, requested=requested):
+                self.assertEqual(media.describe_request(requested), text)
+
+    def test_a_refusal_names_the_type_it_judged(self):
+        """The only mismatch is the type: the text names the job's type, not the roll's."""
+        dk11202 = frame(62, 0x0B, 100)
+        tape = req(0x8E, 0x0A, 62, 100)                 # 62 mm continuous, with a length
+        self.assertEqual(media.compare_media(tape, dk11202), (("type",), ()))
+        self.assertEqual(media.describe_request(tape), "62 mm continuous tape")
+        labels = req(0x86, 0x0B, 29)                    # 29 mm die-cut, no length
+        self.assertEqual(media.compare_media(labels, frame(62, 0x0A, 0, 0x81)), (("type", "width"), ()))
+        self.assertEqual(media.describe_request(labels), "29 mm die-cut labels")
+
+
 class DkPartsTest(unittest.TestCase):
     def test_roll_codes(self):
         self.assertEqual(media.dk_parts_for(st(REF_DK22251_IDLE)), ("DK-22251",))

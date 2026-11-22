@@ -21,13 +21,13 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from unittest import mock
 
 from tests.fake_printer import (FAKE_SERIAL, PTOUCH_TRAILER, RESYNC_REQUEST, TEST_DEVICE_ID, FakeBus,
                                 PrinterModel, PtyPrinter)
 
-from ql810wc import config, proxyd, rasterproto, statecache, usbio  # noqa: E402  (path set by fake_printer)
+from ql810wc import config, media, proxyd, rasterproto, statecache, usbio  # noqa: E402  (path set by fake_printer)
 from ql810wc.proxyd import ProxyDaemon, ProxySettings, SdNotifier  # noqa: E402
 from ql810wc.rasterproto import (INVALIDATE, PHASE_PRINTING, RESYNC, STATUS_REQUEST,  # noqa: E402
                                  ST_PHASE_CHANGE)
@@ -946,10 +946,856 @@ class ColorCheckTest(unittest.TestCase):
         k = MONO.index(b"\x1b\x69\x4b") + 4
         job = MONO[:k] + b"\x5a" * 20000 + MONO[k:]
         h = Harness(self).start()
-        with mock.patch.object(proxyd, "_COLOR_HOLD_LIMIT", 1000):
+        with mock.patch.object(proxyd, "_CHECK_HOLD_LIMIT", 1000):
             h.send_job(job, pieces=2, pause=0.3)
         self.assertEqual(h.session_bytes().count(job), 1, "past the hold limit the job goes through unchecked")
         self.assertNotEqual(h.state()["job"]["last_result"], "refused")
+
+
+#: A job's set-up bytes: 400 x NUL, ESC @, ESC i a 01 (raster command mode).
+SETUP = INVALIDATE + rasterproto.ESC_INIT + b"\x1b\x69\x61\x01"
+#: One two-colour raster line (a w row for each plane) and one black-only line (a g row).
+LINE_W = b"\x77\x01\x5a" + b"\xff" * 90 + b"\x77\x02\x5a" + bytes(90)
+LINE_G = b"\x67\x00\x5a" + b"\xff" * 90
+
+
+def _info(flags: int, kind: int, width: int, length: int = 0, lines: int = 20, page: int = 0) -> bytes:
+    """The ten parameter bytes of an ``ESC i z``: n1 flags, media type, width
+    and length (mm), raster lines (n5-n8) and page (n9)."""
+    return bytes((flags, kind, width, length)) + lines.to_bytes(4, "little") + bytes((page, 0))
+
+
+# ESC i z parameters as Brother's macOS driver (4.0.3, PPD 4.0.4) sends them on a network
+# queue (local renders). Flags 0x8E ask the printer to check the media type, width and length.
+MAC_62 = bytes.fromhex("8E 0A 3E 00 57 04 00 00 00 00")        # 2.4": 62 mm continuous, 1111 lines
+MAC_62_748 = bytes.fromhex("8E 0A 3E 00 EC 02 00 00 00 00")    # Length 69.1 mm, Margin 3 mm: 748 lines
+MAC_DC03 = bytes.fromhex("8E 0B 1D 5A DF 03 00 00 00 00")      # 1.1" x 3.5" (the queue's default): 29x90 die-cut
+MAC_DC06 = bytes.fromhex("8E 0B 3E 1D 0F 01 00 00 00 00")      # 2.4" x 1.1": 62x29 die-cut
+MAC_29 = bytes.fromhex("8E 0A 1D 00 57 04 00 00 00 00")        # 1.1": 29 mm continuous
+MAC_HIGH_RES = bytes.fromhex("CE 0A 3E 00 AF 08 00 00 00 00")  # 2-Color + High resolution (ESC i K 49), 62 mm
+
+
+def _page(info: Optional[bytes], expanded: Optional[int] = 0x09, *, lines: int = 20, last: bool = True,
+          before_rows: bytes = b"") -> bytes:
+    """A page laid out like make_test_job's: ``ESC i z`` + ``info`` (None: no
+    ESC i z), ESC i M 40, ESC i A 01, ``ESC i K`` ``expanded`` (None: no ESC i
+    K), ESC i d 23 00, ``before_rows``, ``lines`` raster lines (w rows when
+    ``expanded`` asks for two colours, else g rows), then 0x1A (``last``) or 0x0C."""
+    out = b"" if info is None else PRINT_INFO + info
+    out += b"\x1b\x69\x4d\x40" + b"\x1b\x69\x41\x01"
+    if expanded is not None:
+        out += b"\x1b\x69\x4b" + bytes((expanded,))
+    out += b"\x1b\x69\x64\x23\x00" + before_rows
+    out += (LINE_W if expanded is not None and expanded & 0x01 else LINE_G) * lines
+    return out + (b"\x1a" if last else b"\x0c")
+
+
+def _job(*pages: bytes) -> bytes:
+    """The set-up bytes, then ``pages``."""
+    return SETUP + b"".join(pages)
+
+
+#: The queue's default paper (29x90 die-cut) as a two-colour and as a black-only job.
+TWO_DC03 = _job(_page(MAC_DC03))
+MONO_DC03 = _job(_page(MAC_DC03, 0x08))
+#: A two-colour job for 62 mm continuous tape (DK-22251 takes it).
+TWO_62 = _job(_page(_info(0x86, 0x0A, 62)))
+#: The fake printer's roll unless a test loads another one.
+DK22251 = "62mm continuous black/red (DK-22251)"
+
+
+def _send_bytewise(sock: socket.socket, data: bytes) -> str:
+    """Send ``data`` one byte per TCP segment and half-close; then how the
+    proxy ended the connection (see _send_and_close)."""
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    try:
+        for i in range(len(data)):
+            sock.sendall(data[i:i + 1])
+        sock.shutdown(socket.SHUT_WR)
+    except OSError:
+        return "rst"
+    return _how_closed(sock)
+
+
+def _requests_before_the_job(h: Harness, start: int) -> int:
+    """``ESC i S`` the printer got from stream offset ``start`` up to the next ``ESC i z``."""
+    received = bytes(h.model.received)
+    return received[start:received.index(PRINT_INFO, start)].count(STATUS_REQUEST)
+
+
+class _GoneOnRequest(FakePrinter):
+    """A fake printer that is unplugged by the next status request once ``armed``."""
+
+    armed = False
+
+    def write(self, data: usbio.BytesLike, timeout: float) -> int:
+        if self.armed and bytes(data).endswith(STATUS_REQUEST):
+            self.armed = False
+            self.unplug()
+        return super().write(data, timeout)
+
+
+class MediaCheckTest(unittest.TestCase):
+    """RAW_MEDIA_CHECK: a job whose first page asks the printer to check media
+    that the loaded roll does not match, or a two-colour job in high
+    resolution on a black/red roll, never reaches the printer. Brother
+    documents that the printer rejects such a job ("replace media"), and
+    owners of the QL-800 and QL-810W report that it then stops until the roll
+    cover is opened and closed; the fake printer models that (it is not seen
+    on the tested unit). Every other job goes through byte for byte."""
+
+    def assert_refused(self, h: Harness, job: bytes, detail: str) -> List[str]:
+        """Send ``job`` on a new connection: the client sees a reset, the job is
+        recorded and logged as refused with ``detail``, and none of its print
+        data reaches the printer, which still answers. Returns the log lines."""
+        start = len(h.model.received)
+        jobs = len(h.model.jobs)
+        with self.assertLogs("ql810wc.proxyd", "INFO") as logs:
+            self.assertEqual(_send_refusable(h, job), "rst", "the client sees the job fail")
+            _wait_logged(h, logs, f", result refused ({detail})")       # the job line
+        state = h.state()["job"]
+        self.assertEqual(state["last_result"], "refused")
+        self.assertFalse(state["active"])
+        self.assertEqual(state["last_detail"], detail)
+        self.assertTrue(any(line.startswith("WARNING:ql810wc.proxyd:refused a print job from 127.0.0.1:")
+                            and line.endswith(f": {detail}. None of its print data was sent to the printer")
+                            for line in logs.output), logs.output)
+        rest = bytes(h.model.received[start:])
+        self.assertNotIn(PRINT_INFO, rest, "none of the job's print data reached the printer")
+        self.assertTrue(SETUP.startswith(rest.replace(STATUS_REQUEST, b"")),
+                        "status requests only (and the job's set-up bytes, had they come in a read of their own)")
+        self.assertEqual(len(h.model.jobs), jobs)
+        self.assertEqual(h.model.violations, [])
+        self.assertFalse(h.model.mute, "the printer still answers")
+        return logs.output
+
+    def assert_through(self, h: Harness, job: bytes) -> Tuple[Dict[str, Any], List[str]]:
+        """Send ``job``: it reaches the printer once, whole and unmodified, and is
+        not refused. Returns the job's state and the log lines."""
+        before = bytes(h.model.received).count(job)
+        with self.assertLogs("ql810wc.proxyd", "INFO") as logs:
+            self.assertEqual(h.send_job(job), b"")
+            _wait_logged(h, logs, ", result ")                          # the job line
+        self.assertEqual(bytes(h.model.received).count(job), before + 1, "forwarded byte for byte")
+        state = h.state()["job"]
+        self.assertNotEqual(state["last_result"], "refused")
+        self.assertEqual(h.model.violations, [])
+        return state, logs.output
+
+    # -- refused -------------------------------------------------------------------
+    def test_die_cut_labels_on_continuous_tape_are_refused(self):
+        # The queue's default paper on DK-22251, two-colour: only the media is wrong.
+        h = Harness(self).start()
+        detail = f"a job for 29x90 mm die-cut labels, but the loaded roll is {DK22251}"
+        output = self.assert_refused(h, TWO_DC03, detail)
+        self.assertTrue(any("two-color, requested 29x90 mm die-cut, 991 lines (83.9 mm of print), flags 0x8e, "
+                            f"result refused ({detail})" in line for line in output), output)
+        job = h.state()["job"]
+        self.assertIs(job["two_color"], True)
+        self.assertEqual(job["requested_media"], {"flags": 0x8E, "type": 0x0B, "width": 29, "length": 90,
+                                                  "lines": 991, "page": 0})
+        self.assertNotIn("expanded_mode", job, "not published")
+        start = len(h.model.received)
+        _wait_polls(h, start, 2)
+        self.assertEqual(bytes(h.model.received[start:]).replace(STATUS_REQUEST, b""), b"",
+                         "no resync: the printer's input was never touched")
+        self.assertEqual(self.assert_through(h, TWO_62)[0]["last_result"], "ok")
+
+    def test_another_width_is_refused(self):
+        h = Harness(self).start()
+        self.assert_refused(h, _job(_page(MAC_29)),
+                            f"a job for 29 mm continuous tape, but the loaded roll is {DK22251}")
+
+    def test_continuous_tape_on_die_cut_labels_is_refused(self):
+        # MONO (make_test_job) asks the printer to check the type and width (n1 0x86).
+        h = Harness(self)
+        h.model.set_media("62x100")                 # DK-11202, one colour
+        h.start()
+        self.assert_refused(h, MONO, "a job for 62 mm continuous tape, but the loaded roll is 62mm x 100mm die-cut "
+                                     "(DK-11202)")
+        self.assertEqual(self.assert_through(h, _job(_page(_info(0x8E, 0x0B, 62, 100), 0x08)))[0]["last_result"],
+                         "ok", "a job for the roll's own labels")
+
+    def test_a_die_cut_label_length_may_be_1_mm_off(self):
+        # Status byte 17 is the printer's rounded label length (60x86 reads 87).
+        h = Harness(self)
+        h.model.set_media("29x90")                  # DK-11201, one colour
+        h.start()
+        for length in (88, 92):
+            with self.subTest(length=length):
+                self.assert_refused(h, _job(_page(_info(0x8E, 0x0B, 29, length), 0x08)),
+                                    f"a job for 29x{length} mm die-cut labels, but the loaded roll is 29mm x 90mm "
+                                    "die-cut (DK-11201)")
+        for length in (89, 90, 91):
+            with self.subTest(length=length):
+                state, _ = self.assert_through(h, _job(_page(_info(0x8E, 0x0B, 29, length), 0x08)))
+                self.assertEqual(state["last_result"], "ok")
+
+    def test_a_black_only_job_for_die_cut_labels_names_both_problems(self):
+        h = Harness(self).start()
+        self.assert_refused(h, MONO_DC03, f"a black-only job for 29x90 mm die-cut labels, but the loaded roll is "
+                                          f"{DK22251}, which takes two-color jobs only")
+
+    def test_a_job_without_a_colour_mode_is_still_checked_for_its_media(self):
+        h = Harness(self).start()
+        self.assert_refused(h, _job(_page(MAC_DC03, None)),
+                            f"a job for 29x90 mm die-cut labels, but the loaded roll is {DK22251}")
+
+    def test_two_colors_in_high_resolution_are_refused_on_a_black_red_roll(self):
+        h = Harness(self).start()
+        detail = (f"a two-color job in high resolution mode, but the loaded roll, {DK22251}, prints two colors in "
+                  "standard resolution only")
+        output = self.assert_refused(h, _job(_page(MAC_HIGH_RES, 0x49)), detail)
+        self.assertTrue(any("two-color, requested 62 mm continuous, 2223 lines (94.1 mm of print), flags 0xce, "
+                            "result refused" in line for line in output), output)      # 600-dpi lines
+        self.assert_refused(h, _job(_page(_info(0xCE, 0x0A, 29, 0, 2223), 0x49)),
+                            f"a two-color job for 29 mm continuous tape in high resolution mode, but the loaded "
+                            f"roll is {DK22251}, which prints two colors in standard resolution only")
+
+    def test_headers_of_brothers_mac_driver(self):
+        colour = f"a black-only job, but the loaded roll, {DK22251}, takes two-color jobs only"
+        cases = [
+            ('2.4" 2-Color', _page(MAC_62, 0x0B), None),
+            ('2.4" Monochrome', _page(MAC_62, 0x0A), colour),
+            ("Length 69.1 mm 2-Color", _page(MAC_62_748, 0x09), None),
+            ("Length 69.1 mm Monochrome", _page(MAC_62_748, 0x08), colour),
+            ('1.1" x 3.5" 2-Color', _page(MAC_DC03, 0x09),
+             f"a job for 29x90 mm die-cut labels, but the loaded roll is {DK22251}"),
+            ('2.4" x 1.1" 2-Color', _page(MAC_DC06, 0x09),
+             f"a job for 62x29 mm die-cut labels, but the loaded roll is {DK22251}"),
+            ('1.1" 2-Color', _page(MAC_29, 0x09),
+             f"a job for 29 mm continuous tape, but the loaded roll is {DK22251}"),
+            ('2.4" 2-Color + High resolution', _page(MAC_HIGH_RES, 0x49),
+             f"a two-color job in high resolution mode, but the loaded roll, {DK22251}, prints two colors in "
+             "standard resolution only"),
+        ]
+        h = Harness(self).start()
+        for name, page, refusal in cases:
+            with self.subTest(name):
+                if refusal is None:
+                    self.assertEqual(self.assert_through(h, _job(page))[0]["last_result"], "ok")
+                else:
+                    self.assert_refused(h, _job(page), refusal)
+        own = Harness(self)
+        own.model.set_media("29x90")
+        own.start()
+        self.assertEqual(self.assert_through(own, _job(_page(MAC_DC03, 0x08)))[0]["last_result"], "ok",
+                         "the queue's default paper on its own roll")
+
+    def test_a_roll_known_only_within_the_length_tolerance_is_named(self):
+        """A 60x86 roll that reports a label length of 86 (Brother's raster
+        reference; P-touch's table says 87) is unknown to P-touch's exact rule
+        but judged by the lenient lookup: the texts name it as judged, not as
+        an unsupported roll."""
+        h = Harness(self)
+        h.model.set_media("60x86")                  # DK-11234, one colour
+        h.model.base[17] = 86
+        h.start()
+        self.assertIsNone(h.state()["status"]["media"]["label_id"], "P-touch would not know it")
+        roll = "60mm x 86mm die-cut (DK-11234)"
+        self.assert_refused(h, MONO_DC03, f"a job for 29x90 mm die-cut labels, but the loaded roll is {roll}")
+        state, output = self.assert_through(h, _job(_page(_info(0x80, 0x0B, 29, 90), 0x08)))
+        self.assertEqual(state["last_result"], "ok")
+        self.assertTrue(any(line.endswith(f" for 29x90 mm die-cut labels goes to the printer unchecked: the loaded "
+                                          f"roll is {roll}, but the job does not ask the printer to check its width "
+                                          "or length") for line in output), output)
+
+    def test_a_refusal_names_the_media_type_the_job_asks_for(self):
+        """A header's media type decides how it reads (media.describe_request),
+        as it decides the type compare_media judges: a continuous-tape header
+        with a length, or a die-cut one without, is not named as the roll's
+        own media."""
+        cases = [
+            ("62x100", {"flags": 0x8E, "type": 0x0A, "width": 62, "length": 100},
+             "a job for 62 mm continuous tape, but the loaded roll is 62mm x 100mm die-cut (DK-11202)"),
+            ("62red", {"flags": 0x86, "type": 0x0B, "width": 29, "length": 0},
+             f"a job for 29 mm die-cut labels, but the loaded roll is {DK22251}"),
+        ]
+        for roll, requested, detail in cases:
+            with self.subTest(detail):
+                frame = media.synthesize_status(media.lookup_label(roll))
+                self.assertEqual(proxyd._refusal_detail(frame, None, requested, False), (detail, ()))
+
+    def test_the_colour_rule_refuses_through_a_fault(self):
+        """Only the media rules wait out a fault: a black-only job on DK-22251
+        is refused while the printer reports one (after such a job the tested
+        unit needed a power cycle). The fault seen at the last poll is read
+        again once, and that reply decides."""
+        faults: Dict[str, Callable[[PrinterModel], None]] = {
+            "cover open": lambda m: m.set_cover_open(True),
+            "end of media": lambda m: setattr(m, "err1", 0x02),
+        }
+        for name, fault in faults.items():
+            with self.subTest(name):
+                h = Harness(self, poll_seconds=30.0)   # no idle poll after the first one
+                fault(h.model)
+                h.start()
+                start = len(h.model.received)
+                self.assert_refused(h, MONO, f"a black-only job, but the loaded roll, {DK22251}, takes two-color "
+                                             "jobs only")
+                self.assertEqual(bytes(h.model.received[start:]).count(STATUS_REQUEST), 1)
+
+    # -- passes ----------------------------------------------------------------------
+    def test_62_mm_continuous_jobs_go_through(self):
+        h = Harness(self).start()
+        for flags, lines, expanded in ((0x8E, 748, 0x09), (0x8E, 1111, 0x0B), (0x8E, 2402, 0x09),
+                                       (0xCE, 748, 0x09), (0x86, 600, 0x09)):     # 0xCE: the quality bit
+            with self.subTest(flags=flags, lines=lines):
+                state, output = self.assert_through(h, _job(_page(_info(flags, 0x0A, 62, 0, lines), expanded)))
+                self.assertEqual(state["last_result"], "ok")
+                mm = f"{lines * 25.4 / 300:.1f}"
+                self.assertTrue(any(f"two-color, requested 62 mm continuous, {lines} lines ({mm} mm of print), "
+                                    f"flags 0x{flags:02x}, result ok" in line for line in output), output)
+                self.assertFalse(any("unchecked" in line for line in output), output)
+
+    def test_fields_the_job_does_not_ask_to_check_go_through_with_a_note(self):
+        h = Harness(self).start()
+        for flags in (0x80, 0x00):
+            with self.subTest(flags=flags):
+                state, output = self.assert_through(h, _job(_page(_info(flags, 0x0B, 29, 90))))
+                self.assertEqual(state["last_result"], "ok", "Brother: the printer checks only the flagged fields")
+                self.assertTrue(any(line.startswith("INFO:ql810wc.proxyd:a job from 127.0.0.1:") and line.endswith(
+                    f" for 29x90 mm die-cut labels goes to the printer unchecked: the loaded roll is {DK22251}, "
+                    "but the job does not ask the printer to check its type or width") for line in output), output)
+        die_cut = Harness(self)
+        die_cut.model.set_media("29x90")
+        die_cut.start()
+        state, output = self.assert_through(die_cut, _job(_page(_info(0x86, 0x0B, 29, 88), 0x08)))
+        self.assertEqual(state["last_result"], "ok")
+        self.assertTrue(any(line.endswith(
+            " for 29x88 mm die-cut labels goes to the printer unchecked: the loaded roll is 29mm x 90mm die-cut "
+            "(DK-11201), but the job does not ask the printer to check its length") for line in output), output)
+
+    def test_black_only_high_resolution_on_a_single_color_roll_goes_through(self):
+        h = Harness(self)
+        h.model.set_media("62")                     # DK-22205
+        h.start()
+        state, output = self.assert_through(h, _job(_page(_info(0xCE, 0x0A, 62, 0, 2223), 0x48)))
+        self.assertEqual(state["last_result"], "ok")
+        self.assertTrue(any("black only, requested 62 mm continuous, 2223 lines (94.1 mm of print), flags 0xce, "
+                            "result ok" in line for line in output), output)
+
+    def test_two_colors_in_high_resolution_are_judged_on_a_black_red_roll_only(self):
+        """Brother's high-resolution rule is about the black/red roll: on a
+        single-colour roll only the colour rule speaks."""
+        job = _job(_page(MAC_HIGH_RES, 0x49))
+        h = Harness(self, color_check=False)
+        h.model.set_media("62")                     # DK-22205
+        h.start()
+        state, _ = self.assert_through(h, job)
+        self.assertIn("media does not support two-color printing", state["last_detail"])
+        checked = Harness(self)
+        checked.model.set_media("62")
+        checked.start()
+        self.assert_refused(checked, job, "a two-color job, but the loaded roll, 62mm continuous (DK-22205, DK-44205, "
+                                          "DK-44605), cannot print red")
+
+    def test_the_job_line_shows_the_print_header(self):
+        h = Harness(self).start()
+        state, output = self.assert_through(h, JOB)
+        self.assertEqual(state["last_result"], "ok")
+        self.assertTrue(any("two-color, requested 62 mm continuous, 600 lines (50.8 mm of print), flags 0x86, "
+                            "result ok" in line for line in output), output)
+
+    # -- uncertain: through ------------------------------------------------------------
+    def test_an_uncertain_request_goes_through(self):
+        """Two-colour jobs for 29x90 die-cut labels, refused on DK-22251 when their
+        media is certain, go through when it is not; so does a high-resolution
+        job whose first row contradicts its two-colour ESC i K."""
+        page = _page(None)
+        row_end = page.index(LINE_W) + len(LINE_W)
+        jobs = {
+            "no ESC i z": _job(page),
+            "ESC @ after its ESC i z": _job(PRINT_INFO + MAC_DC03 + rasterproto.ESC_INIT + page),
+            "ESC i z only after the first row": _job(page[:row_end] + PRINT_INFO + MAC_DC03 + page[row_end:]),
+            "an unknown command before the first row": _job(_page(MAC_DC03, before_rows=b"\x1b\x69\x55\x58\x00")),
+            "ESC i K 49 with g rows": _job(_page(MAC_HIGH_RES, 0x49).replace(LINE_W, LINE_G)),
+        }
+        for name, job in jobs.items():
+            with self.subTest(name):
+                h = Harness(self).start()
+                self.assert_through(h, job)
+
+    def test_an_uncertain_roll_goes_through(self):
+        def no_roll(model: PrinterModel) -> None:
+            model.base[10] = model.base[11] = 0     # as the tested unit reports a removed roll
+
+        cases: Dict[str, Tuple[Dict[str, Any], Optional[Callable[[PrinterModel], None]]]] = {
+            "no recent status": ({"status_max_age": 0.0}, None),
+            "an unknown roll": ({}, lambda m: m.base.__setitem__(10, 61)),
+            "no roll": ({}, no_roll),
+            "cover open": ({}, lambda m: m.set_cover_open(True)),
+            "end of media": ({}, lambda m: setattr(m, "err1", 0x02)),
+        }
+        for name, (settings, change) in cases.items():
+            with self.subTest(name):
+                h = Harness(self, **settings)
+                if change is not None:
+                    change(h.model)
+                h.start()
+                self.assert_through(h, TWO_DC03)
+
+    def test_a_job_that_does_not_show_its_media_soon_goes_through(self):
+        job = _job(_page(MAC_DC03, before_rows=b"\x5a" * 20000))   # 20000 blank lines before the first row
+        cut = job.index(LINE_W)
+        h = Harness(self).start()
+        sock = h.connect()
+        with mock.patch.object(proxyd, "_CHECK_HOLD_LIMIT", 1000):
+            sock.sendall(job[:cut])
+            h.wait_for(lambda: PRINT_INFO in bytes(h.model.received), "past the hold limit the job goes on")
+        _send_and_close(sock, job[cut:])
+        self.assertEqual(bytes(h.model.received).count(job), 1, "unchecked, byte for byte")
+        self.assertNotEqual(h.state()["job"]["last_result"], "refused")
+
+    # -- the setting -------------------------------------------------------------------
+    def test_the_check_off_forwards_every_job(self):
+        with self.assertLogs("ql810wc.proxyd", "WARNING") as logs:
+            h = Harness(self, media_check=False).start()
+        self.assertIn("WARNING:ql810wc.proxyd:RAW_MEDIA_CHECK is off: jobs go to the printer without the media check",
+                      logs.output)
+        self.assertFalse(any("RAW_COLOR_CHECK" in line for line in logs.output), logs.output)
+        state, _ = self.assert_through(h, TWO_DC03)
+        self.assertEqual(state["last_result"], "error")
+        self.assertIn("replace media", state["last_detail"])
+        self.assertEqual(h.model.jobs[-1]["media_mismatch"], ("type", "width"))
+        self.assertTrue(h.model.mute, "what the check prevents: the printer stops answering")
+        h.model.set_cover_open(True)                # what owners report clears it (Brother's first step)
+        h.model.set_cover_open(False)
+        h.wait_state(lambda s: s["device"]["state"] == "ready" and (s["status"]["parsed"] or {}).get("errors") == [],
+                     "the printer answers again")
+        self.assertEqual(self.assert_through(h, TWO_62)[0]["last_result"], "ok")
+
+    def test_the_check_off_forwards_two_colors_in_high_resolution(self):
+        h = Harness(self, media_check=False).start()
+        state, _ = self.assert_through(h, _job(_page(MAC_HIGH_RES, 0x49)))
+        self.assertEqual(state["last_result"], "error")
+        self.assertIn("replace media", state["last_detail"])
+        self.assertTrue(h.model.jobs[-1]["high_resolution"])
+
+    def test_each_check_works_alone(self):
+        with self.subTest("RAW_COLOR_CHECK off"):
+            with self.assertLogs("ql810wc.proxyd", "WARNING") as logs:
+                h = Harness(self, color_check=False).start()
+            self.assertIn("WARNING:ql810wc.proxyd:RAW_COLOR_CHECK is off: jobs go to the printer without the colour "
+                          "check", logs.output)
+            self.assertFalse(any("RAW_MEDIA_CHECK" in line for line in logs.output), logs.output)
+            self.assert_refused(h, MONO_DC03, f"a job for 29x90 mm die-cut labels, but the loaded roll is {DK22251}")
+            state, _ = self.assert_through(h, MONO)
+            self.assertIn("media does not support monochrome printing", state["last_detail"])
+        with self.subTest("RAW_MEDIA_CHECK off"):
+            h = Harness(self, media_check=False).start()
+            self.assert_refused(h, MONO_DC03, f"a black-only job, but the loaded roll, {DK22251}, takes two-color "
+                                              "jobs only")
+            state, _ = self.assert_through(h, TWO_DC03)
+            self.assertIn("replace media", state["last_detail"])
+        with self.subTest("both off"):
+            h = Harness(self, color_check=False, media_check=False).start()
+            self.assert_through(h, MONO_DC03)
+
+    # -- how the job is judged -------------------------------------------------------------
+    def test_a_multi_page_job_is_judged_by_its_first_page(self):
+        """Sent at once, a multi-page job may have all its headers parsed when
+        the verdict comes: the verdict and the job line follow page 1's ESC i z."""
+        tape = _page(_info(0x86, 0x0A, 62, 0, 10), lines=10, last=False)
+        labels = _page(_info(0x8E, 0x0B, 29, 90, 10), lines=10, last=False)
+        cases = {
+            "page 2 asks for other media": (
+                _job(tape, _page(_info(0x8E, 0x0B, 29, 90, 10, page=1), lines=10)), None,
+                "two-color, requested 62 mm continuous, 10 lines (0.8 mm of print), flags 0x86, result ok"),
+            "page 1 asks for other media": (
+                _job(labels, _page(_info(0x86, 0x0A, 62, 0, 10, page=1), lines=10)),
+                f"a job for 29x90 mm die-cut labels, but the loaded roll is {DK22251}",
+                "two-color, requested 29x90 mm die-cut, 10 lines (0.8 mm of print), flags 0x8e, result refused"),
+        }
+        for name, (job, refusal, job_line) in cases.items():
+            for bytewise in (False, True):
+                with self.subTest(name, bytewise=bytewise):
+                    # No idle poll after start-up: a slow bytewise send would get one among
+                    # the job's leading NULs (legal, but then the job is not contiguous).
+                    h = Harness(self, poll_seconds=30.0).start()
+                    with self.assertLogs("ql810wc.proxyd", "INFO") as logs:
+                        sock = h.connect()
+                        how = _send_bytewise(sock, job) if bytewise else _send_and_close(sock, job)
+                        _wait_logged(h, logs, ", result ")
+                    self.assertTrue(any(job_line in line for line in logs.output), logs.output)
+                    state = h.state()["job"]
+                    self.assertEqual(state["requested_media"]["page"], 0, "page 1's header is published")
+                    if refusal is None:
+                        self.assertEqual(how, "fin")
+                        self.assertEqual(state["last_result"], "ok")
+                        self.assertEqual(bytes(h.model.received).count(job), 1)
+                    else:
+                        self.assertEqual(how, "rst")
+                        self.assertEqual((state["last_result"], state["last_detail"]), ("refused", refusal))
+                        self.assertNotIn(PRINT_INFO, bytes(h.model.received))
+                        self.assertFalse(h.model.mute)
+                    self.assertEqual(h.model.violations, [])
+
+    def test_media_shown_before_the_stream_turns_opaque_counts(self):
+        # An unknown command right after the first row: refused however the job is split.
+        cut = TWO_DC03.index(LINE_W) + len(LINE_W)
+        job = TWO_DC03[:cut] + b"\x1b\x69\x55\x58\x00" + TWO_DC03[cut:]
+        for pieces in (1, 2):
+            with self.subTest(pieces=pieces):
+                h = Harness(self).start()
+                sock = h.connect()
+                if pieces == 1:
+                    how = _send_and_close(sock, job)
+                else:
+                    sock.sendall(job[:cut])
+                    h.wait_state(lambda s: s["job"]["last_result"] == "refused", "refused with the first piece")
+                    how = _send_and_close(sock, job[cut:])
+                self.assertEqual(how, "rst")
+                self.assertEqual(h.state()["job"]["last_detail"],
+                                 f"a job for 29x90 mm die-cut labels, but the loaded roll is {DK22251}")
+                self.assertNotIn(PRINT_INFO, bytes(h.model.received))
+                self.assertFalse(h.model.mute)
+
+    def test_a_job_with_nothing_to_judge_asks_the_printer_nothing(self):
+        """Without an ESC i z and an ESC i K for the checks that are on, the
+        verdict needs no status: none is asked for, even when the last is stale."""
+        cases = [
+            ("no ESC i z, no ESC i K", {}, _job(_page(None, None)), 0),
+            ("no ESC i z, the colour check off", {"color_check": False}, _job(_page(None)), 0),
+            ("no ESC i K, the media check off", {"media_check": False}, _job(_page(MAC_DC03, None)), 0),
+            ("an ESC i K to judge", {}, _job(_page(None)), 1),
+            ("an ESC i z to judge", {}, _job(_page(MAC_DC03, None)), 1),
+        ]
+        for name, settings, job, requests in cases:
+            with self.subTest(name):
+                h = Harness(self, poll_seconds=30.0, status_max_age=0.0, **settings).start()
+                start = len(h.model.received)
+                self.assert_through(h, job)
+                received = bytes(h.model.received)
+                first = received.index(b"\x1b\x69\x4d\x40", start)        # ESC i M 40: in every job here
+                self.assertEqual(received[start:first].count(STATUS_REQUEST), requests)
+
+    def test_a_job_is_held_until_its_first_raster_row(self):
+        h = Harness(self).start()
+        cut = TWO_DC03.index(LINE_W)
+        sock = h.connect()
+        sock.sendall(TWO_DC03[:cut])
+        h.wait_state(lambda s: s["job"]["active"] and s["job"]["bytes"] == cut, "the daemon read the job's commands")
+        self.assertNotIn(PRINT_INFO, bytes(h.model.received), "held: its ESC i z alone decides nothing")
+        self.assertEqual(_send_and_close(sock, TWO_DC03[cut:]), "rst")
+        self.assertEqual(h.state()["job"]["last_result"], "refused")
+        self.assertNotIn(PRINT_INFO, bytes(h.model.received))
+        self.assertFalse(h.model.mute)
+
+    def test_a_second_job_on_a_connection_is_checked_too(self):
+        h = Harness(self).start()
+        sock = h.connect()
+        sock.sendall(TWO_62)
+        h.wait_state(lambda s: s["job"]["last_result"] == "ok" and not s["job"]["active"], "the first job printed")
+        start = len(h.model.received)
+        self.assertEqual(_send_and_close(sock, TWO_DC03), "rst")
+        state = h.state()["job"]
+        self.assertEqual((state["last_result"], state["last_detail"]),
+                         ("refused", f"a job for 29x90 mm die-cut labels, but the loaded roll is {DK22251}"))
+        rest = bytes(h.model.received[start:])
+        self.assertNotIn(PRINT_INFO, rest)
+        self.assertTrue(SETUP.startswith(rest.replace(STATUS_REQUEST, b"")))
+        self.assertEqual(len(h.model.jobs), 1)
+        self.assertFalse(h.model.mute)
+
+    # -- the status the verdict is judged on --------------------------------------------------
+    def test_a_refusal_judged_on_an_earlier_status_is_confirmed(self):
+        """The roll may have changed since the last idle poll: before a refusal
+        the printer is asked once more, and its reply decides."""
+        def no_roll(model: PrinterModel) -> None:
+            model.base[10] = model.base[11] = 0
+
+        cases: Dict[str, Tuple[Optional[Callable[[PrinterModel], None]], bytes, Optional[str]]] = {
+            "the reply agrees": (None, TWO_DC03,
+                                 f"a job for 29x90 mm die-cut labels, but the loaded roll is {DK22251}"),
+            "another roll": (lambda m: m.set_media("29x90"), MONO_DC03, None),
+            # The reply's roll still warrants a refusal: the reasons are its own.
+            "another roll, still refused": (lambda m: m.set_media("62"), TWO_DC03,
+                                            "a two-color job for 29x90 mm die-cut labels, but the loaded roll is "
+                                            "62mm continuous (DK-22205, DK-44205, DK-44605), which cannot print red"),
+            "no roll": (no_roll, TWO_DC03, None),
+            "cover open": (lambda m: m.set_cover_open(True), TWO_DC03, None),
+            # The colour check's refusals are confirmed the same way.
+            "the reply agrees, colour only": (None, MONO, f"a black-only job, but the loaded roll, {DK22251}, takes "
+                                                          "two-color jobs only"),
+            "another roll, colour only": (lambda m: m.set_media("62"), MONO, None),
+        }
+        for name, (change, job, refusal) in cases.items():
+            with self.subTest(name):
+                h = Harness(self, poll_seconds=30.0).start()   # no idle poll after the first one
+                if change is not None:
+                    change(h.model)
+                start = len(h.model.received)
+                if refusal is not None:
+                    self.assert_refused(h, job, refusal)
+                    self.assertEqual(bytes(h.model.received[start:]).count(STATUS_REQUEST), 1,
+                                     "one status request before the refusal")
+                    continue
+                state, _ = self.assert_through(h, job)
+                self.assertEqual(_requests_before_the_job(h, start), 1, "one status request; its reply decides")
+                if name.startswith("another roll"):
+                    self.assertEqual(state["last_result"], "ok")
+                    self.assertEqual(h.state()["status"]["media"]["label_id"], "29x90" if job is MONO_DC03 else "62")
+
+    def test_a_status_read_for_the_verdict_is_not_confirmed_again(self):
+        # The idle polls pause while set-up commands wait on a connection: the status goes stale,
+        # the check asks for a new one, and that reply decides at once. (No idle poll follows
+        # the refusal within the test: the next one is 30 s away.)
+        h = Harness(self, poll_seconds=30.0, status_max_age=1.0).start()
+        sock = h.connect()
+        sock.sendall(SETUP)
+        h.wait_for(lambda: h.session_bytes().endswith(SETUP), "the set-up bytes reached the printer")
+        start = len(h.model.received)
+        h.wait_state(lambda s: time.time() - s["status"]["polled"] > 1.5, "the last status went stale")
+        self.assertEqual(_send_and_close(sock, TWO_DC03[len(SETUP):]), "rst")
+        self.assertEqual(h.state()["job"]["last_result"], "refused")
+        self.assertEqual(bytes(h.model.received[start:]), STATUS_REQUEST, "one status request, none of the job")
+
+    def test_without_an_answer_the_last_status_decides(self):
+        with self.subTest("a refusal to confirm: the earlier status stands"):
+            h = Harness(self, poll_seconds=30.0).start()
+            h.model.mute = True
+            start = len(h.model.received)
+            self.assertEqual(_send_refusable(h, TWO_DC03), "rst")
+            state = h.state()["job"]
+            self.assertEqual((state["last_result"], state["last_detail"]),
+                             ("refused", f"a job for 29x90 mm die-cut labels, but the loaded roll is {DK22251}"))
+            rest = bytes(h.model.received[start:])
+            self.assertEqual(rest.count(STATUS_REQUEST), 1, "asked once, in vain")
+            self.assertNotIn(PRINT_INFO, rest)
+        for name, requests in (("a stale status, no answer", 1), ("a stale status, the input state unknown", 0)):
+            with self.subTest(name):
+                h = Harness(self, poll_seconds=0.1, status_max_age=1.0).start()
+                sock = h.connect()
+                sock.sendall(SETUP)
+                h.wait_for(lambda: h.session_bytes().endswith(SETUP), "the set-up bytes reached the printer")
+                start = len(h.model.received)
+                h.wait_state(lambda s: time.time() - s["status"]["polled"] > 1.5, "the last status went stale")
+                if requests:
+                    h.model.mute = True
+                else:
+                    h.daemon.link.unknown = True    # as a torn write leaves it: no status request then
+                _send_and_close(sock, TWO_DC03[len(SETUP):])
+                self.assertEqual(bytes(h.model.received).count(TWO_DC03[len(SETUP):]), 1, "unchecked, byte for byte")
+                self.assertNotEqual(h.state()["job"]["last_result"], "refused")
+                self.assertEqual(_requests_before_the_job(h, start), requests)
+
+    def test_no_roll_or_a_fault_seen_earlier_is_read_again(self):
+        """Closing the roll cover sends no status, so a roll just loaded shows
+        only at the next poll: a status read earlier that shows no roll or a
+        fault is read again before the job is judged. The reply decides, and
+        no confirm read follows it."""
+        def no_roll(model: PrinterModel) -> None:
+            model.base[10] = model.base[11] = 0     # as the tested unit reports a removed roll
+
+        size = f"a job for 29x90 mm die-cut labels, but the loaded roll is {DK22251}"
+        colour = f"a black-only job, but the loaded roll, {DK22251}, takes two-color jobs only"
+        cases: Dict[str, Tuple[Callable[[PrinterModel], None], Callable[[PrinterModel], None], bytes, str]] = {
+            "cover open at the last poll, then closed": (
+                lambda m: m.set_cover_open(True), lambda m: m.set_cover_open(False), TWO_DC03, size),
+            "no roll at the last poll, then DK-22251": (no_roll, lambda m: m.set_media("62red"), TWO_DC03, size),
+            "no roll at the last poll, then DK-22251, colour": (no_roll, lambda m: m.set_media("62red"), MONO,
+                                                                 colour),
+        }
+        for name, (earlier, now, job, refusal) in cases.items():
+            with self.subTest(name):
+                h = Harness(self, poll_seconds=30.0)   # no idle poll after the first one
+                earlier(h.model)
+                h.start()
+                now(h.model)
+                start = len(h.model.received)
+                self.assert_refused(h, job, refusal)
+                self.assertEqual(bytes(h.model.received[start:]).count(STATUS_REQUEST), 1,
+                                 "one status request; its reply decides")
+
+    def test_a_fault_still_in_the_reply_lets_the_job_through(self):
+        """Through a fault the media rules are not judged (the printer holds jobs
+        then): asked again, the cover is still open, and the job goes through."""
+        h = Harness(self, poll_seconds=30.0)
+        h.model.set_cover_open(True)
+        h.start()
+        start = len(h.model.received)
+        self.assert_through(h, TWO_DC03)
+        self.assertEqual(_requests_before_the_job(h, start), 1, "read again once")
+
+    def test_a_fault_seen_earlier_is_read_again_for_the_colour_rule_too(self):
+        """The colour rule judges a frame with a fault, but a fault seen earlier
+        is read again for it too: a roll swap passes through cover open, and
+        the single-colour roll the last poll saw with the cover open may be
+        DK-22251 by now (after a black-only job on DK-22251 the tested unit
+        needed a power cycle). Here the media rules have nothing to judge."""
+        cases: Dict[str, Tuple[Dict[str, Any], bytes]] = {
+            "media check off": ({"media_check": False}, MONO),
+            "no ESC i z": ({}, _job(_page(None, 0x08))),
+        }
+        for name, (overrides, job) in cases.items():
+            with self.subTest(name):
+                h = Harness(self, poll_seconds=30.0, **overrides)   # no idle poll after the first one
+                h.model.set_media("62")                 # DK-22205: one colour
+                h.model.set_cover_open(True)
+                h.start()                               # the last poll: DK-22205, cover open
+                h.model.set_media("62red")              # DK-22251 goes in and the cover closes;
+                h.model.set_cover_open(False)           # no frame says so
+                start = len(h.model.received)
+                self.assert_refused(h, job, f"a black-only job, but the loaded roll, {DK22251}, takes "
+                                            "two-color jobs only")
+                self.assertEqual(bytes(h.model.received[start:]).count(STATUS_REQUEST), 1, "read again once")
+
+    def test_a_printer_that_does_not_answer_delays_the_verdict_once(self):
+        """A fault seen earlier is read again; when the printer does not answer,
+        the earlier frame decides at once, with no confirm read (no second
+        wait). Through the fault only the colour rule refuses."""
+        h = Harness(self, poll_seconds=30.0)
+        h.model.set_cover_open(True)
+        h.start()
+        h.model.mute = True
+        start = len(h.model.received)
+        self.assertEqual(_send_refusable(h, MONO), "rst")
+        state = h.state()["job"]
+        self.assertEqual((state["last_result"], state["last_detail"]),
+                         ("refused", f"a black-only job, but the loaded roll, {DK22251}, takes two-color jobs only"))
+        rest = bytes(h.model.received[start:])
+        self.assertEqual(rest.count(STATUS_REQUEST), 1, "asked once, in vain, and not again")
+        self.assertNotIn(PRINT_INFO, rest)
+        self.assertEqual(h.model.violations, [])
+
+    def test_no_confirm_read_while_the_input_state_is_unknown(self):
+        """While the printer's input state is unknown (a torn write), a refusal
+        judged on an earlier frame stands: a bare ESC i S could land inside a
+        command. The status request after the connection resynchronises the
+        printer; had the verdict asked, its reply would have cleared the
+        unknown state, and no resync would follow."""
+        h = Harness(self, poll_seconds=30.0).start()   # no idle poll after the first one
+        h.daemon.link.unknown = True                   # as a torn write leaves it
+        start = len(h.model.received)
+        self.assert_refused(h, TWO_DC03, f"a job for 29x90 mm die-cut labels, but the loaded roll is {DK22251}")
+        h.wait_for(lambda: bytes(h.model.received[start:]).endswith(RESYNC_REQUEST), "the resync")
+        rest = bytes(h.model.received[start:])
+        if rest.startswith(SETUP):
+            rest = rest[len(SETUP):]                   # the job's set-up bytes, had they come in a read of their own
+        self.assertEqual(rest, RESYNC_REQUEST, "no status request for the verdict, then the resync")
+        self.assertEqual(h.model.violations, [])
+
+    def test_a_status_request_the_printer_takes_in_part_tears_the_job(self):
+        """The job is never sent behind a status request of the check that the
+        printer took only in part (it may wait inside that command): the job
+        is torn with none of it sent, and the next request resynchronises."""
+        cases = {
+            "the request that confirms a refusal": {"poll_seconds": 0.2},
+            "the request that reads a stale status again": {"poll_seconds": 0.1, "status_max_age": 1.0},
+        }
+        for name, settings in cases.items():
+            with self.subTest(name):
+                h = Harness(self, **settings).start()
+                sock = h.connect()
+                sock.sendall(SETUP)
+                h.wait_for(lambda: h.session_bytes().endswith(SETUP), "the set-up bytes reached the printer")
+                start = len(h.model.received)
+                if "status_max_age" in settings:
+                    h.wait_state(lambda s: time.time() - s["status"]["polled"] > 1.5, "the last status went stale")
+                h.printer.stall_after = h.printer.total_written + 1    # one more byte, then nothing
+                self.assertEqual(_send_and_close(sock, TWO_DC03[len(SETUP):]), "rst")
+                state = h.state()["job"]
+                self.assertEqual(state["last_result"], "torn")
+                self.assertEqual(state["last_detail"], "the printer took the check's status request only in part; "
+                                                       "none of its print data was sent to the printer")
+                self.assertEqual(bytes(h.model.received[start:]), STATUS_REQUEST[:1],
+                                 "a third of the request, none of the job")
+                h.printer.set_stalled(False)
+                h.wait_for(lambda: len(h.model.received) >= start + 1 + len(RESYNC_REQUEST), "the next request")
+                rest = bytes(h.model.received[start:])
+                self.assertTrue(rest.startswith(STATUS_REQUEST[:1] + RESYNC_REQUEST), rest[:8].hex(" "))
+                self.assertNotIn(PRINT_INFO, rest)
+                self.assertEqual(h.model.violations, [])
+                self.assertEqual(self.assert_through(h, TWO_62)[0]["last_result"], "ok")
+
+    def test_a_queued_connection_after_a_status_request_taken_in_part_follows_a_resync(self):
+        """After the check's status request went out only in part, a connection
+        already waiting in the listen backlog is served only after the next
+        idle poll has resynchronised the printer, even with a job that does not
+        start with NULs and ESC @ of its own."""
+        h = Harness(self, poll_seconds=30.0, status_timeout=2.0).start()
+        sock = h.connect()
+        sock.sendall(SETUP)
+        h.wait_for(lambda: h.session_bytes().endswith(SETUP), "the set-up bytes reached the printer")
+        second = _page(_info(0x86, 0x0A, 62))       # starts at ESC i z
+        queued = h.connect()                        # waits in the listen backlog
+        queued.sendall(second)
+        queued.shutdown(socket.SHUT_WR)
+        start = len(h.model.received)
+        h.printer.stall_after = h.printer.total_written + 1    # one more byte, then nothing
+        self.assertEqual(_send_and_close(sock, TWO_DC03[len(SETUP):]), "rst")
+        self.assertEqual(h.state()["job"]["last_result"], "torn")
+        h.printer.set_stalled(False)
+        self.assertEqual(_recv_until_closed(queued), b"")
+        state = h.wait_state(lambda s: not s["job"]["active"] and s["job"]["bytes"] == len(second),
+                             "the queued job settled")
+        self.assertEqual(state["job"]["last_result"], "ok")
+        rest = bytes(h.model.received[start:])
+        self.assertTrue(rest.startswith(STATUS_REQUEST[:1] + RESYNC_REQUEST + second), rest[:8].hex(" "))
+        self.assertFalse(h.model.jobs[-1]["failed"])
+        self.assertEqual(h.model.violations, [])
+
+    def test_a_printer_lost_during_the_check_tears_the_job(self):
+        printer = _GoneOnRequest()
+        h = Harness(self, bus=FakeBus(printer), poll_seconds=30.0).start()
+        printer.armed = True                        # the check's status request unplugs it
+        start = len(h.model.received)
+        self.assertEqual(_send_refusable(h, TWO_DC03), "rst")
+        detail = h.state()["job"]["last_detail"]
+        self.assertEqual(h.state()["job"]["last_result"], "torn")
+        self.assertTrue(detail.startswith("the printer is not available (")
+                        and detail.endswith("; none of its print data was sent to the printer"), detail)
+        self.assertNotIn(PRINT_INFO, bytes(h.model.received[start:]))
+        printer.replug()
+        h.wait_state(lambda s: s["device"]["state"] == "ready" and s["status"]["raw_hex"], "the printer is back")
+        self.assertEqual(self.assert_through(h, TWO_62)[0]["last_result"], "ok")
+
+
+class JobLineTest(unittest.TestCase):
+    def test_describe_print_header(self):
+        cases = [
+            ({"flags": 0x86, "lines": 600}, None, "600 lines (50.8 mm of print), flags 0x86"),
+            ({"flags": 0x8E, "lines": 748}, 0x09, "748 lines (63.3 mm of print), flags 0x8e"),
+            ({"flags": 0x8E, "lines": 1111}, 0x0B, "1111 lines (94.1 mm of print), flags 0x8e"),
+            ({"flags": 0xCE, "lines": 2223}, 0x49, "2223 lines (94.1 mm of print), flags 0xce"),   # 600 dpi
+            ({"flags": 0xCE, "lines": 2223}, 0x48, "2223 lines (94.1 mm of print), flags 0xce"),
+            ({"flags": 0xCE, "lines": 2223}, None, "2223 lines (188.2 mm of print), flags 0xce"),
+            ({"flags": 0x80, "lines": 0}, 0x09, "flags 0x80"),
+            ({}, None, "flags 0x00"),
+        ]
+        for requested, expanded, text in cases:
+            with self.subTest(text):
+                self.assertEqual(proxyd.describe_print_header(requested, expanded), text)
+        self.assertEqual(proxyd.describe_print_header({"flags": 0x8E, "lines": 748}), "748 lines (63.3 mm of print), "
+                                                                                       "flags 0x8e")
+        self.assertIn("describe_print_header", proxyd.__all__)
+
+    def test_describe_requested_media(self):
+        """The media type decides first, as in media.describe_request (and the
+        refusal texts): a length decides only for other types."""
+        cases = [
+            ({"type": 0x0A, "width": 62}, "requested 62 mm continuous"),
+            ({"type": 0x0A, "width": 62, "length": 100}, "requested 62 mm continuous"),
+            ({"type": 0x0B, "width": 29, "length": 90}, "requested 29x90 mm die-cut"),
+            ({"type": 0x0B, "width": 29}, "requested 29 mm die-cut"),
+            ({"type": 0x4B, "width": 29, "length": 90}, "requested 29x90 mm die-cut"),
+            ({"type": 0x4A, "width": 29}, "requested 29 mm continuous"),
+            ({"width": 29, "length": 90}, "requested 29x90 mm die-cut"),
+            ({"width": 29}, "requested 29 mm continuous"),
+        ]
+        for requested, text in cases:
+            with self.subTest(text, requested=requested):
+                self.assertEqual(proxyd.describe_requested_media(requested), text)
+
+    def test_summary(self):
+        job = proxyd.JobRecord(peer="192.0.2.5:1", started=0.0, started_mono=0.0, bytes=4179, two_color=False,
+                               requested_media={"flags": 0x8E, "type": 0x0A, "width": 62, "length": 0, "lines": 748,
+                                                "page": 0},
+                               expanded_mode=0x08, result="refused", detail="a black-only job", finished_mono=0.0)
+        self.assertEqual(job.summary(), "job from 192.0.2.5:1: 4179 bytes in 0.0 s, black only, requested 62 mm "
+                                        "continuous, 748 lines (63.3 mm of print), flags 0x8e, result refused "
+                                        "(a black-only job)")
 
 
 class SetupConnectionTest(unittest.TestCase):
@@ -1484,6 +2330,115 @@ class FakeModelTest(unittest.TestCase):
         model.feed(JOB[:cut] + STATUS_REQUEST)
         self.assertEqual(len(model.violations), 1)
 
+    def test_a_media_mismatch_stops_the_printer_until_the_cover_is_opened_and_closed(self):
+        model = PrinterModel()
+        model.feed(TWO_DC03)
+        job = model.jobs[-1]
+        self.assertTrue(job["failed"])
+        self.assertEqual(job["media"], {"flags": 0x8E, "type": 0x0B, "width": 29, "length": 90})
+        self.assertEqual(job["media_mismatch"], ("type", "width"))
+        frames = rasterproto.iter_status_frames(model.pending())
+        self.assertEqual([(f.status_type, f.errors()) for f in frames], [(rasterproto.ST_ERROR, ["replace media"])])
+        self.assertTrue(model.mute and model.replace_media)
+        model.feed(STATUS_REQUEST)
+        self.assertEqual(model.pending(), b"", "no answer")
+        model.set_cover_open(True)
+        model.feed(STATUS_REQUEST)
+        self.assertEqual(model.pending(), b"", "no answer with the cover open either")
+        model.set_cover_open(False)
+        self.assertFalse(model.mute or model.replace_media)
+        model.feed(STATUS_REQUEST)
+        self.assertEqual([f.errors() for f in rasterproto.iter_status_frames(model.pending())], [[]])
+        model.feed(TWO_62)
+        self.assertFalse(model.jobs[-1]["failed"])
+        model.feed(TWO_DC03)
+        self.assertTrue(model.mute)
+        model.power_cycle()
+        self.assertFalse(model.mute or model.replace_media or model.err2)
+
+    def test_a_cover_cycle_does_not_end_the_colour_lock_up(self):
+        """After a black-only job on DK-22251 the tested unit answered nothing
+        until it was switched off and on. A media mismatch before or after it
+        does not let a cover cycle end that."""
+        for name, jobs in (("black-only, then die-cut labels", (MONO, TWO_DC03)),
+                           ("die-cut labels, then black-only", (TWO_DC03, MONO))):
+            with self.subTest(name):
+                model = PrinterModel()
+                for job in jobs:
+                    model.feed(job)
+                self.assertEqual([j["failed"] for j in model.jobs], [True, True])
+                self.assertTrue(model.mute and model.replace_media)
+                self.assertEqual(model.error_detail, 0x24)
+                model.set_cover_open(True)
+                model.set_cover_open(False)
+                self.assertFalse(model.replace_media, "the cover cycle clears 'replace media'")
+                self.assertTrue(model.mute, "but not the colour lock-up")
+                model.pending()
+                model.feed(STATUS_REQUEST)
+                self.assertEqual(model.pending(), b"", "no answer")
+                model.power_cycle()
+                model.feed(STATUS_REQUEST)
+                self.assertEqual([f.errors() for f in rasterproto.iter_status_frames(model.pending())], [[]])
+
+    def test_the_media_rule_checks_what_the_job_asks_for(self):
+        unflagged = _job(_page(_info(0x80, 0x0B, 29, 90)))
+        model = PrinterModel()
+        model.feed(unflagged)
+        self.assertFalse(model.jobs[-1]["failed"], "Brother: n1 says which fields the printer checks")
+        strict = PrinterModel()
+        strict.checks_unflagged = True
+        strict.feed(unflagged)
+        self.assertEqual(strict.jobs[-1]["media_mismatch"], ("type", "width"))
+        die_cut = PrinterModel()
+        die_cut.set_media("29x90")
+        for length, failed in ((88, True), (89, False), (90, False), (91, False), (92, True)):
+            die_cut.power_cycle()
+            die_cut.feed(_job(_page(_info(0x8E, 0x0B, 29, length), 0x08)))
+            self.assertEqual(die_cut.jobs[-1]["failed"], failed, length)
+        die_cut.power_cycle()
+        die_cut.length_tolerance = 0
+        die_cut.feed(_job(_page(_info(0x8E, 0x0B, 29, 89), 0x08)))
+        self.assertEqual(die_cut.jobs[-1]["media_mismatch"], ("length",))
+        tape = PrinterModel()
+        tape.feed(_job(_page(_info(0x8E, 0x0A, 62, 100))))
+        self.assertFalse(tape.jobs[-1]["failed"], "continuous tape takes any length")
+        no_roll = PrinterModel()
+        no_roll.base[10] = no_roll.base[11] = 0
+        no_roll.feed(TWO_DC03)
+        self.assertEqual(no_roll.jobs[-1]["media_mismatch"], (), "a printer without a roll is not modelled")
+
+    def test_a_job_is_judged_by_its_first_print_information(self):
+        model = PrinterModel()
+        model.feed(_job(_page(_info(0x86, 0x0A, 62), last=False), _page(_info(0x8E, 0x0B, 29, 90, page=1))))
+        self.assertFalse(model.jobs[-1]["failed"])
+        self.assertEqual(model.jobs[-1]["media"]["width"], 62)
+        model.feed(_job(_page(_info(0x8E, 0x0B, 29, 90), last=False), _page(_info(0x86, 0x0A, 62, page=1))))
+        self.assertEqual(model.jobs[-1]["media_mismatch"], ("type", "width"))
+        cleared = PrinterModel()
+        cleared.feed(_job(PRINT_INFO + MAC_DC03 + rasterproto.ESC_INIT + _page(None)))
+        self.assertIsNone(cleared.jobs[-1]["media"], "ESC @ cancels what came before it")
+        self.assertFalse(cleared.jobs[-1]["failed"])
+
+    def test_two_colors_in_high_resolution_fail_on_a_black_red_roll(self):
+        model = PrinterModel()
+        model.feed(_job(_page(MAC_HIGH_RES, 0x49)))
+        job = model.jobs[-1]
+        self.assertTrue(job["failed"] and job["high_resolution"])
+        self.assertEqual(job["media_mismatch"], ())
+        self.assertTrue(model.replace_media)
+        self.assertFalse(model.mute, "an assumption: the printer keeps answering")
+        model.pending()
+        model.feed(STATUS_REQUEST)
+        self.assertEqual(rasterproto.iter_status_frames(model.pending())[-1].errors(), ["replace media"])
+        model.set_cover_open(True)
+        model.set_cover_open(False)
+        self.assertEqual(model.err2, 0)
+        single = PrinterModel()
+        single.set_media("62")
+        single.feed(_job(_page(_info(0xCE, 0x0A, 62), 0x48)))
+        self.assertFalse(single.jobs[-1]["failed"], "black only in high resolution")
+        self.assertTrue(single.jobs[-1]["high_resolution"])
+
 
 class ListenerTest(unittest.TestCase):
     def test_parse_listen(self):
@@ -1543,18 +2498,27 @@ class SettingsTest(unittest.TestCase):
         self.assertFalse(settings.bidirectional)
         self.assertEqual(settings.device, "auto")
         self.assertTrue(settings.color_check)
+        self.assertTrue(settings.media_check)
         self.assertEqual(settings.status_max_age, 60.0)
-        self.assertEqual((ProxySettings().color_check, ProxySettings().status_max_age), (True, 60.0))
+        self.assertEqual((ProxySettings().color_check, ProxySettings().media_check, ProxySettings().status_max_age),
+                         (True, True, 60.0))
 
     def test_values_and_overrides(self):
         cfg = config.load_runtime_config(None)
         cfg.update(RAW_PORT="9101", RAW_BIND="192.0.2.10", RAW_BIDIRECTIONAL="yes", STATUS_POLL_SECONDS="5",
                    RAW_IDLE_TIMEOUT="120", MAX_JOB_BYTES="1048576", USB_PRODUCT_ID="209C",
-                   STATE_FILE="/tmp/x.json", RAW_COLOR_CHECK="no", STATUS_MAX_AGE_SECONDS="90")
+                   STATE_FILE="/tmp/x.json", RAW_COLOR_CHECK="no", RAW_MEDIA_CHECK="no", STATUS_MAX_AGE_SECONDS="90")
         settings = ProxySettings.from_config(cfg, listen=("127.0.0.1", 0), device="/dev/usb/lp1")
         self.assertEqual(settings.listen, ("127.0.0.1", 0))
         self.assertTrue(settings.bidirectional)
         self.assertFalse(settings.color_check)
+        self.assertFalse(settings.media_check)
+        for key, expected in (("RAW_COLOR_CHECK", (False, True)), ("RAW_MEDIA_CHECK", (True, False))):
+            with self.subTest(key=key):
+                alone = config.load_runtime_config(None)
+                alone[key] = "no"
+                checks = ProxySettings.from_config(alone)
+                self.assertEqual((checks.color_check, checks.media_check), expected, "each setting on its own")
         self.assertEqual(settings.status_max_age, 90.0)
         self.assertEqual(settings.poll_seconds, 5.0)
         self.assertEqual(settings.raw_idle_timeout, 120.0)
@@ -1567,7 +2531,7 @@ class SettingsTest(unittest.TestCase):
 
     def test_invalid_values(self):
         for key, value in (("RAW_IDLE_TIMEOUT", "1"), ("RAW_IDLE_TIMEOUT", "soon"), ("MAX_JOB_BYTES", "100"),
-                           ("RAW_COLOR_CHECK", "maybe")):
+                           ("RAW_COLOR_CHECK", "maybe"), ("RAW_MEDIA_CHECK", "maybe")):
             with self.subTest(key=key, value=value):
                 cfg = config.load_runtime_config(None)
                 cfg[key] = value

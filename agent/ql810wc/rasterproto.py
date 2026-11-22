@@ -95,6 +95,29 @@ MEDIA_TYPES: Dict[int, str] = {
     MEDIA_DIE_CUT: "die-cut",
 }
 
+# ``ESC i z`` (print information) n1 flags, named as in Brother's raster
+# reference. Per that reference, the printer checks a media field of the job
+# against the loaded roll only when its flag is set, and reports error
+# information 2 bit 0 ("replace media") when they differ.
+#: n1 bit 1: the media type (n2, ``0x0A`` continuous / ``0x0B`` die-cut) is valid.
+PI_KIND = 0x02
+#: n1 bit 2: the media width (n3, mm) is valid.
+PI_WIDTH = 0x04
+#: n1 bit 3: the media length (n4, mm; die-cut labels) is valid.
+PI_LENGTH = 0x08
+#: n1 bit 6: priority given to print quality (ignored for two-colour printing).
+PI_QUALITY = 0x40
+#: n1 bit 7: printer recovery always on (Brother's drivers always set it).
+PI_RECOVER = 0x80
+
+# ``ESC i K`` (expanded mode) bits.
+#: Two-colour (black/red) printing; the job's raster rows are then ``w`` rows.
+EXPANDED_TWO_COLOR = 0x01
+#: Cut at the end of the job.
+EXPANDED_CUT_AT_END = 0x08
+#: High resolution (600 dpi along the feed). Brother's guide: not with two-colour printing.
+EXPANDED_HIGH_RESOLUTION = 0x40
+
 #: Byte 25 bit 7: a black/red (two-colour) roll is loaded.
 TWO_COLOR_BIT = 0x80
 #: Exact byte-25 value of DK-22251 on QL-800/810W/820NWBc (P-touch for Mac
@@ -508,7 +531,7 @@ def iter_status_frames(buf: Union[bytes, bytearray, memoryview]) -> List[Status]
 
 
 # ---------------------------------------------------------------------------
-# Job tokenizer (it never modifies bytes; proxyd's colour check and hold-back act on what it sees)
+# Job tokenizer (it never modifies bytes; proxyd's checks and hold-back act on what it sees)
 # ---------------------------------------------------------------------------
 
 class Event(NamedTuple):
@@ -600,6 +623,13 @@ class RasterTokenizer:
       point and, at a raster row, agrees with it (bit 0 set for ``w`` rows,
       clear for ``g`` rows); ``ESC @`` clears the ``ESC i K`` it relies on.
       Both reset when the next job's content starts.
+    * ``decided_media`` / ``decided_expanded_mode`` - what the job's first
+      page asks for: copies of ``requested_media`` and ``expanded_mode`` taken
+      at that same decision point (None when no ``ESC i z`` / ``ESC i K`` came
+      before it; an ``ESC @`` before that point leaves them None, as it
+      clears the values they copy). Unlike ``requested_media`` (the last
+      ``ESC i z`` so far), they keep page 1's header when the following pages
+      arrive in the same read. Both reset when the next job's content starts.
     * ``jobs`` / ``pages`` - ``0x1A`` count / print commands (``0x0C`` + ``0x1A``).
     * ``two_color`` - bit 0 of the last ``ESC i K`` (``expanded_mode`` holds
       the raw value). Reset, with ``requested_media``, ``compression`` and
@@ -647,6 +677,8 @@ class RasterTokenizer:
         self.setup_commands = 0
         self.color_decided = False
         self.requested_two_color: Optional[bool] = None
+        self.decided_media: Optional[Dict[str, int]] = None
+        self.decided_expanded_mode: Optional[int] = None
         self.nul_bytes = 0
         self.row_counts: Dict[str, int] = {"g": 0, "w1": 0, "w2": 0, "Z": 0}
         self.opaque: Optional[str] = None
@@ -698,6 +730,8 @@ class RasterTokenizer:
             "setup_commands": self.setup_commands,
             "color_decided": self.color_decided,
             "requested_two_color": self.requested_two_color,
+            "decided_media": dict(self.decided_media) if self.decided_media else None,
+            "decided_expanded_mode": self.decided_expanded_mode,
             "nul_bytes": self.nul_bytes,
             "in_job": self.in_job,
             "job_ended": self.job_ended,
@@ -863,7 +897,7 @@ class RasterTokenizer:
             self._job_content()
         if kind == "expanded_mode":
             self.expanded_mode = params[0]
-            self.two_color = bool(params[0] & 0x01)
+            self.two_color = bool(params[0] & EXPANDED_TWO_COLOR)
         elif kind == "print_info":
             self.requested_media = {
                 "flags": params[0],
@@ -893,18 +927,23 @@ class RasterTokenizer:
             self.job_ended = False
             self.color_decided = False
             self.requested_two_color = None
+            self.decided_media = None
+            self.decided_expanded_mode = None
 
     def _decide_color(self, two_color_row: Optional[bool]) -> None:
         """Record the colour mode the job asks for, at its first raster row
         (``two_color_row``: True for ``w``, False for ``g``) or, without one,
         at its first print command (None): the last ``ESC i K`` bit 0, unless
-        the row disagrees with it; unknown without an ``ESC i K``."""
+        the row disagrees with it; unknown without an ``ESC i K``. The media
+        and expanded mode in force at that point are kept as
+        ``decided_media`` / ``decided_expanded_mode``."""
         self.color_decided = True
-        mode = self.expanded_mode
+        self.decided_media = dict(self.requested_media) if self.requested_media is not None else None
+        mode = self.decided_expanded_mode = self.expanded_mode
         if mode is None:
             self.requested_two_color = None
             return
-        two = bool(mode & 0x01)
+        two = bool(mode & EXPANDED_TWO_COLOR)
         self.requested_two_color = None if two_color_row is not None and two_color_row != two else two
 
     def _go_opaque(self, events: List[Event], offset: int, head: bytes, reason: str,
@@ -1033,11 +1072,12 @@ def make_test_job(width_mm: int = 62, two_color: bool = True, pattern: str = "ba
     job = bytearray(INVALIDATE)
     job += ESC_INIT
     job += b"\x1b\x69\x61\x01"                                   # raster command mode
-    job += b"\x1b\x69\x7a" + bytes((0x86, MEDIA_CONTINUOUS, width_mm, 0))
+    job += b"\x1b\x69\x7a" + bytes((PI_RECOVER | PI_WIDTH | PI_KIND, MEDIA_CONTINUOUS, width_mm, 0))
     job += lines.to_bytes(4, "little") + b"\x00\x00"             # line count, first page
     job += b"\x1b\x69\x4d\x40"                                   # auto cut
     job += b"\x1b\x69\x41\x01"                                   # cut every label
-    job += b"\x1b\x69\x4b" + (b"\x09" if two_color else b"\x08")  # (two-colour +) cut at end
+    expanded = EXPANDED_CUT_AT_END | (EXPANDED_TWO_COLOR if two_color else 0)
+    job += b"\x1b\x69\x4b" + bytes((expanded,))                  # (two-colour +) cut at end
     job += b"\x1b\x69\x64" + FEED_MARGIN_DOTS.to_bytes(2, "little")
     encoded: Dict[int, bytes] = {}
 

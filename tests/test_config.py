@@ -434,7 +434,7 @@ class SettingsTableTest(unittest.TestCase):
     def test_every_setting_is_documented_and_typed(self):
         required = {"RAW_PORT", "RAW_BIND", "RAW_BIDIRECTIONAL", "STATUS_POLL_SECONDS", "USB_VENDOR_ID",
                     "USB_PRODUCT_ID", "USB_SERIAL", "MEDIA_DEFAULT", "PRINTER_UUID", "PRINTER_NAME_SUFFIX",
-                    "RAW_IDLE_TIMEOUT", "MAX_JOB_BYTES", "RAW_COLOR_CHECK"}
+                    "RAW_IDLE_TIMEOUT", "MAX_JOB_BYTES", "RAW_COLOR_CHECK", "RAW_MEDIA_CHECK"}
         self.assertTrue(required <= set(config.SETTINGS))
         self.assertTrue(any(key.startswith("PERSONA_") for key in config.SETTINGS))
         for key, setting in config.SETTINGS.items():

@@ -10,7 +10,13 @@
   flight (:attr:`PrinterModel.violations`). It rejects a job whose colour
   mode the roll cannot print, and after a black-only job on DK-22251 it
   answers nothing until :meth:`PrinterModel.power_cycle`, as the tested unit
-  did.
+  did. It also rejects a job whose first ``ESC i z`` asks the printer to
+  check media the roll does not match, and a two-colour job in high
+  resolution on a black/red roll, with "replace media"; after a media
+  mismatch it answers nothing until the roll cover is opened and closed
+  (which does not end the colour lock-up). These two rules model Brother's
+  documentation and third-party reports (QL-800, QL-810W), not the tested
+  unit.
 * :class:`FakePrinter` - an in-process :class:`ql810wc.usbio.Transport` on
   top of a model, with slow writes, stalls, a last transfer that never
   completes, early empty reads and unplugging.
@@ -73,6 +79,22 @@ class PrinterModel:
     ``fail_next_job = (err1, err2)``: the next job ends in an error frame.
     ``error_detail``: byte 31 of the frames (a colour-mismatch code; see
     :meth:`_color_mismatch`).
+
+    At a job's end, after the colour rule, the media rules (see
+    :meth:`_media_mismatch` and :meth:`_end_job`; Brother's documentation
+    and third-party reports, not the tested unit): ``length_tolerance``
+    (mm) is how far a die-cut label length may be from status byte 17;
+    ``checks_unflagged`` makes the model compare the type, width and length
+    whatever the job's ``ESC i z`` flags say (a printer stricter than
+    Brother's reference). ``replace_media``: the error information 2 bit
+    0x01 ("replace media") the media rules set; it stays until the roll
+    cover is opened and closed (:meth:`set_cover_open`) or the printer is
+    switched off and on (:meth:`power_cycle`).
+
+    Each entry of :attr:`jobs` also holds ``media`` (the job's first
+    ``ESC i z``: flags, type, width, length; None without one),
+    ``media_mismatch`` (the fields the media rule rejected) and
+    ``high_resolution`` (its ``ESC i K`` has bit 0x40).
     """
 
     def __init__(self, status: bytes = IDLE_DK22251, *, notify: bool = True,
@@ -88,6 +110,10 @@ class PrinterModel:
         self.error_detail = 0
         self.after_reply: Optional[bytes] = None           # a frame sent right behind the next reply
         self.fail_next_job: Optional[Tuple[int, int]] = None
+        self.length_tolerance = 1
+        self.checks_unflagged = False
+        self.replace_media = False
+        self._replace_media_mutes = False                  # the mute came with replace_media
         self.received = bytearray()
         self.receive_log: List[Tuple[float, int]] = []     # (time, stream offset of the chunk)
         self.status_requests: List[int] = []               # stream offsets of ESC i S
@@ -98,6 +124,8 @@ class PrinterModel:
         self._tok_base = 0
         self._job_start: Optional[int] = None
         self._two_color = False
+        self._high_resolution = False                      # the last ESC i K has bit 0x40
+        self._job_media: Optional[Dict[str, int]] = None   # the job's first ESC i z
         self._printing_until = 0.0
         self._seq = 0
         self._out: List[Tuple[float, int, bytes, bool]] = []   # (due, seq, frame, cancellable)
@@ -153,14 +181,30 @@ class PrinterModel:
             self.base = bytearray(media.synthesize_status(found).raw)
 
     def set_cover_open(self, is_open: bool) -> None:
-        """Open/close the roll cover (err2 bit 0x10); replies become type 0x02."""
+        """Open/close the roll cover (err2 bit 0x10); replies become type 0x02.
+        Closing it after it was opened clears :attr:`replace_media` and the
+        muteness that came with it (Brother's first step to clear the error),
+        but never the colour lock-up (``error_detail`` 0x24, after a
+        black-only job on a black/red roll), whichever came first: the model
+        clears that only with :meth:`power_cycle` (the tested unit needed a
+        power cycle)."""
         with self._lock:
-            self.err2 = (self.err2 | 0x10) if is_open else (self.err2 & ~0x10)
+            if is_open:
+                self.err2 |= 0x10
+                return
+            was_open = bool(self.err2 & 0x10)
+            self.err2 &= ~0x10
+            if was_open and self.replace_media:
+                self.err2 &= ~0x01
+                if self._replace_media_mutes and self.error_detail != 0x24:
+                    self.mute = False
+                self.replace_media = self._replace_media_mutes = False
 
     def clear_errors(self) -> None:
         with self._lock:
             self.err1 = self.err2 = 0
             self.error_detail = 0
+            self.replace_media = self._replace_media_mutes = False
 
     def power_cycle(self) -> None:
         """Switch the printer off and on: errors, a held job and muteness are gone."""
@@ -169,6 +213,8 @@ class PrinterModel:
             self.mute = False
             self._job_start = None
             self._two_color = False
+            self._high_resolution = False
+            self._job_media = None
             self._printing_until = 0.0
             self._out.clear()
 
@@ -211,6 +257,8 @@ class PrinterModel:
             self.inits.append(offset)
             self._job_start = None
             self._two_color = False
+            self._high_resolution = False
+            self._job_media = None
             self._printing_until = 0.0
             self._out = [item for item in self._out if not item[3]]
         elif kind == "print_last":
@@ -224,6 +272,10 @@ class PrinterModel:
         elif kind in _JOB_START_EVENTS:
             if kind == "expanded_mode" and params:
                 self._two_color = bool(params[0] & 0x01)
+                self._high_resolution = bool(params[0] & 0x40)
+            elif kind == "print_info" and self._job_media is None:
+                self._job_media = {"flags": params[0], "type": params[1], "width": params[2],
+                                   "length": params[3]}
             if self._job_start is None:
                 self._job_start = offset
 
@@ -239,12 +291,47 @@ class PrinterModel:
             return 0x23
         return 0
 
+    def _media_mismatch(self, requested: Optional[Dict[str, int]]) -> Tuple[str, ...]:
+        """The fields of the job's first ``ESC i z`` (``requested``) that do
+        not match the loaded roll, as Brother's raster reference describes
+        the printer's check: a field counts only when its n1 flag asks for
+        the check (0x02 type, 0x04 width, 0x08 length; all three with
+        :attr:`checks_unflagged`). The type is compared with status byte 11's
+        low nibble, the width with byte 10, and the length with byte 17, on a
+        die-cut roll only (continuous tape takes any length) and within
+        :attr:`length_tolerance` mm. Nothing without an ``ESC i z`` or
+        without a roll (a printer without media is not modelled)."""
+        width, kind, length = self.base[10], self.base[11] & 0x0F, self.base[17]
+        if requested is None or not width or not kind or self.err1 & 0x01:
+            return ()
+        flags = 0x0E if self.checks_unflagged else requested["flags"]
+        found = []
+        if flags & 0x02 and requested["type"] != kind:
+            found.append("type")
+        if flags & 0x04 and requested["width"] != width:
+            found.append("width")
+        if flags & 0x08 and kind == 0x0B and abs(requested["length"] - length) > self.length_tolerance:
+            found.append("length")
+        return tuple(found)
+
+    def _reject_media(self, now: float, *, mute: bool) -> None:
+        """Fail the job that just ended with "replace media" (err2 0x01) and
+        an "error occurred" frame; with ``mute``, answer nothing more until
+        the cover is opened and closed or the printer is switched off and on."""
+        self.err2 |= 0x01
+        self.replace_media = True
+        if mute:
+            self.mute = self._replace_media_mutes = True
+        self._schedule(self.frame(ST_ERROR, PHASE_RECEIVING), now)
+
     def _end_job(self, offset: int, now: float) -> None:
         start = self._job_start if self._job_start is not None else offset
         self._job_start = None
+        requested, self._job_media = self._job_media, None
         done = now + self.print_seconds
         job: Dict[str, Any] = {"start": start, "end": offset + 1, "two_color": self._two_color,
-                               "ended_at": now, "done_at": done, "failed": False}
+                               "ended_at": now, "done_at": done, "failed": False, "media": requested,
+                               "media_mismatch": (), "high_resolution": self._high_resolution}
         self.jobs.append(job)
         mismatch = self._color_mismatch()
         if mismatch:
@@ -255,6 +342,22 @@ class PrinterModel:
             self._schedule(self.frame(ST_ERROR, PHASE_RECEIVING), now)
             if mismatch == 0x24:
                 self.mute = True
+            return
+        fields = self._media_mismatch(requested)
+        if fields:
+            # Brother's raster reference: "replace media". Owners of the QL-800 and a
+            # QL-810W report that the printer then stops answering until the roll cover
+            # is opened and closed (assumed for the QL-810Wc; not seen on the tested unit).
+            job["failed"] = True
+            job["media_mismatch"] = fields
+            self._reject_media(now, mute=True)
+            return
+        if self._two_color and self._high_resolution and self.base[25] == 0x81:
+            # Brother's guide: no high resolution with two-colour printing ("Two-color
+            # media high resolution printing error"). The real printer's encoding of that
+            # error is unknown; modelled (an assumption) as "replace media", not muted.
+            job["failed"] = True
+            self._reject_media(now, mute=False)
             return
         self._printing_until = done
         if self.notify:

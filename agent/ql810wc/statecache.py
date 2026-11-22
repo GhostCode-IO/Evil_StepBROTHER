@@ -42,7 +42,7 @@ SCHEMA_VERSION = 1
 DEFAULT_PATH = "/run/ql810wc-proxy/state.json"
 #: Device states written by the proxy.
 DEVICE_STATES = ("ready", "absent", "mass-storage", "error")
-#: Job results written by the proxy ("refused": RAW_COLOR_CHECK kept it from the printer).
+#: Job results written by the proxy ("refused": RAW_COLOR_CHECK or RAW_MEDIA_CHECK kept it from the printer).
 JOB_RESULTS = ("ok", "error", "torn", "refused")
 #: Files larger than this are rejected as corrupt (the document is ~2 KiB).
 MAX_STATE_BYTES = 1 << 20

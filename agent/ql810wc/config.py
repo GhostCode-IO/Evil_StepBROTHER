@@ -113,7 +113,16 @@ SETTINGS: Dict[str, Setting] = {
         "black-only job on DK-22251 the tested QL-810Wc answered nothing until it was switched "
         "off and on. None of a refused job's print data reaches the printer, and the client "
         "sees the connection reset. Jobs whose colour mode or roll is not certain always go "
-        "through. no = forward every job unchecked."),
+        "through. no = forward such jobs."),
+    "RAW_MEDIA_CHECK": Setting(
+        "yes", "bool", "yes = refuse a print job that asks for other media than the loaded roll: "
+        "a media type (continuous or die-cut), width or die-cut label length the job asks the "
+        "printer to check and the roll does not match, or a two-color job in high resolution "
+        "mode. Brother documents that the printer rejects such jobs, and owners of the QL-800 "
+        "and QL-810W report that after a media mismatch it stops until someone clears it at the "
+        "printer. None of a refused job's print data reaches the printer, and the client sees "
+        "the connection reset. Jobs whose media or roll is not certain (no recent status, no "
+        "roll, a printer fault) always go through. no = forward such jobs."),
     "STATUS_POLL_SECONDS": Setting(
         "3", "int", "Seconds between status polls (ESC i S over USB) while idle. The "
         "printer is never polled during a job.", minimum=1, maximum=60, required=True),
@@ -162,10 +171,11 @@ SETTINGS: Dict[str, Setting] = {
     "STATUS_MAX_AGE_SECONDS": Setting(
         "60", "int", "A status frame older than this while no job is running is stale: "
         "the persona then reports the printer as unavailable instead of serving old "
-        "media and state. The colour check of ql810wc-proxyd (RAW_COLOR_CHECK) asks the "
-        "printer for a new status when the last one is older (not while the printer's "
-        "input state is unknown), and lets a job through unchecked if none comes. Must "
-        "be at least twice STATUS_POLL_SECONDS.",
+        "media and state. The checks of ql810wc-proxyd (RAW_COLOR_CHECK, RAW_MEDIA_CHECK) "
+        "ask the printer for a new status when the last one is older, or shows no roll or a "
+        "fault (not while the printer's input state is unknown); without a recent status that "
+        "shows a roll, they let a job through unchecked. Must be at least twice "
+        "STATUS_POLL_SECONDS.",
         minimum=5, maximum=86400, required=True),
     "PERSONA_LOCATION": Setting(
         "", "str", "sysLocation.0 of the printer persona (Brother clients show it as the "
